@@ -1,8 +1,10 @@
 """
 Feature engineering pour les audiogrammes.
 
-Transforme les dicts {fréquence: dB} en vecteurs numériques fixes
-adaptés aux modèles ML, avec interpolation aux fréquences standard.
+Deux types de features :
+- Absolues  : seuils dB interpolés + dérivées (PTA, asymétrie, chute HF)
+- Delta     : changement vs Baseline du même patient (Periodic / Depart)
+              → plus robuste cliniquement car normalise la variabilité inter-individuelle
 """
 
 import numpy as np
@@ -15,6 +17,14 @@ STANDARD_FREQS = [250, 500, 1000, 2000, 4000, 8000]
 
 PTA_FREQS = [500, 1000, 2000, 4000]
 
+# Standard Threshold Shift (OSHA) : moyenne à 2000, 3000, 4000 Hz
+# ≥ 10 dB = shift cliniquement significatif
+STS_FREQS = [2000, 3000, 4000]
+
+VISIT_CATEGORY_LABELS = {0: "Baseline", 1: "Periodic", 2: "Depart"}
+
+
+# ─── Fonctions de base ────────────────────────────────────────────────────────
 
 def interpolate_thresholds(dots: dict, target_freqs: list[int]) -> dict:
     """
@@ -30,10 +40,7 @@ def interpolate_thresholds(dots: dict, target_freqs: list[int]) -> dict:
     dbs = [dots[f] for f in freqs]
 
     if len(freqs) == 1:
-        result = {}
-        for tf in target_freqs:
-            result[tf] = dbs[0] if tf == freqs[0] else np.nan
-        return result
+        return {tf: (dbs[0] if tf == freqs[0] else np.nan) for tf in target_freqs}
 
     interpolator = interp1d(freqs, dbs, kind="linear", bounds_error=False, fill_value=np.nan)
     return {tf: float(interpolator(tf)) for tf in target_freqs}
@@ -46,7 +53,7 @@ def compute_pta(thresholds: dict, pta_freqs: list[int] = PTA_FREQS) -> float:
 
 
 def compute_high_freq_drop(thresholds: dict) -> float:
-    """Chute haute fréquence : différence entre 4000 Hz et 8000 Hz."""
+    """Chute haute fréquence : différence 8000 Hz − 4000 Hz."""
     v4 = thresholds.get(4000, np.nan)
     v8 = thresholds.get(8000, np.nan)
     if np.isnan(v4) or np.isnan(v8):
@@ -55,7 +62,7 @@ def compute_high_freq_drop(thresholds: dict) -> float:
 
 
 def compute_asymmetry(left_thresh: dict, right_thresh: dict) -> float:
-    """Asymétrie inter-oreilles : moyenne de |OG - OD| sur les fréquences communes."""
+    """Asymétrie inter-oreilles : moyenne de |OG − OD| sur les fréquences communes."""
     diffs = []
     for f in STANDARD_FREQS:
         l_val = left_thresh.get(f, np.nan)
@@ -65,17 +72,30 @@ def compute_asymmetry(left_thresh: dict, right_thresh: dict) -> float:
     return float(np.mean(diffs)) if diffs else np.nan
 
 
-def extract_features(row: pd.Series) -> dict:
+def compute_sts(current_dots: dict, baseline_dots: dict) -> float:
     """
-    Construit le vecteur de features pour un seul record.
+    Standard Threshold Shift (OSHA) : shift moyen aux fréquences 2000/3000/4000 Hz.
 
-    Retourne un dict plat avec toutes les features numériques.
+    Valeur ≥ 10 dB = détérioration cliniquement significative vs Baseline.
+    Interpolation à 3000 Hz si non mesuré directement.
     """
+    cur = interpolate_thresholds(current_dots, STS_FREQS)
+    bas = interpolate_thresholds(baseline_dots, STS_FREQS)
+    deltas = []
+    for f in STS_FREQS:
+        if not np.isnan(cur[f]) and not np.isnan(bas[f]):
+            deltas.append(cur[f] - bas[f])
+    return float(np.mean(deltas)) if deltas else np.nan
+
+
+# ─── Features absolues (par record) ──────────────────────────────────────────
+
+def extract_features(row: pd.Series) -> dict:
+    """Construit le vecteur de features absolues pour un seul record."""
     left_thresh = interpolate_thresholds(row["dots_left"], STANDARD_FREQS)
     right_thresh = interpolate_thresholds(row["dots_right"], STANDARD_FREQS)
 
     features = {}
-
     for freq in STANDARD_FREQS:
         features[f"L_{freq}"] = left_thresh[freq]
         features[f"R_{freq}"] = right_thresh[freq]
@@ -95,17 +115,102 @@ def extract_features(row: pd.Series) -> dict:
 
 def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
-    Construit la matrice de features pour tout le dataset.
+    Construit la matrice de features absolues pour tout le dataset.
 
-    Retourne :
-    - feature_df : DataFrame avec uniquement les colonnes numériques de features
-    - feature_cols : liste des noms de colonnes features
+    Retourne (feature_df, feature_cols).
     """
     feature_rows = df.apply(extract_features, axis=1)
-    feature_df = pd.DataFrame(list(feature_rows))
-    feature_cols = feature_df.columns.tolist()
-    return feature_df, feature_cols
+    feature_df = pd.DataFrame(list(feature_rows), index=df.index)
+    return feature_df, feature_df.columns.tolist()
 
+
+# ─── Features delta (évolution par patient vs Baseline) ───────────────────────
+
+def build_delta_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcule les features de changement par rapport au Baseline de chaque patient.
+
+    Pour chaque record Periodic (cat=1) ou Depart (cat=2), calcule le delta
+    fréquence par fréquence vs le Baseline (cat=0) du même patient.
+
+    Les records Baseline et les patients sans Baseline retournent NaN.
+
+    Retourne un DataFrame aligné sur l'index de df, avec les colonnes :
+      delta_L_{freq}, delta_R_{freq}  — shift en dB par fréquence
+      delta_PTA_L, delta_PTA_R       — shift du PTA
+      delta_high_freq_drop_L/R       — évolution de la chute HF
+      delta_asymmetry                — évolution de l'asymétrie
+      sts_L, sts_R                   — Standard Threshold Shift (2000/3000/4000 Hz)
+      has_sts_L, has_sts_R           — flag : STS ≥ 10 dB
+    """
+    nan_row = {f"delta_L_{f}": np.nan for f in STANDARD_FREQS}
+    nan_row.update({f"delta_R_{f}": np.nan for f in STANDARD_FREQS})
+    nan_row.update({
+        "delta_PTA_L": np.nan, "delta_PTA_R": np.nan,
+        "delta_high_freq_drop_L": np.nan, "delta_high_freq_drop_R": np.nan,
+        "delta_asymmetry": np.nan,
+        "sts_L": np.nan, "sts_R": np.nan,
+        "has_sts_L": np.nan, "has_sts_R": np.nan,
+    })
+
+    # Index : patient → première ligne Baseline (la plus ancienne si plusieurs)
+    baselines = (
+        df[df["visit_category"] == 0]
+        .sort_values("visit_date")
+        .drop_duplicates(subset=["patient"], keep="first")
+        .set_index("patient")
+    )
+
+    rows = []
+    for _, row in df.iterrows():
+        patient = row["patient"]
+
+        if row["visit_category"] == 0 or patient not in baselines.index:
+            rows.append(nan_row.copy())
+            continue
+
+        baseline = baselines.loc[patient]
+
+        cur_left = interpolate_thresholds(row["dots_left"], STANDARD_FREQS)
+        cur_right = interpolate_thresholds(row["dots_right"], STANDARD_FREQS)
+        bas_left = interpolate_thresholds(baseline["dots_left"], STANDARD_FREQS)
+        bas_right = interpolate_thresholds(baseline["dots_right"], STANDARD_FREQS)
+
+        delta_left = {
+            f: cur_left[f] - bas_left[f]
+            for f in STANDARD_FREQS
+            if not np.isnan(cur_left[f]) and not np.isnan(bas_left[f])
+        }
+        delta_right = {
+            f: cur_right[f] - bas_right[f]
+            for f in STANDARD_FREQS
+            if not np.isnan(cur_right[f]) and not np.isnan(bas_right[f])
+        }
+
+        sts_l = compute_sts(row["dots_left"], baseline["dots_left"])
+        sts_r = compute_sts(row["dots_right"], baseline["dots_right"])
+
+        delta_row = {}
+        for f in STANDARD_FREQS:
+            delta_row[f"delta_L_{f}"] = delta_left.get(f, np.nan)
+            delta_row[f"delta_R_{f}"] = delta_right.get(f, np.nan)
+
+        delta_row["delta_PTA_L"] = compute_pta(delta_left)
+        delta_row["delta_PTA_R"] = compute_pta(delta_right)
+        delta_row["delta_high_freq_drop_L"] = compute_high_freq_drop(delta_left)
+        delta_row["delta_high_freq_drop_R"] = compute_high_freq_drop(delta_right)
+        delta_row["delta_asymmetry"] = compute_asymmetry(delta_left, delta_right)
+        delta_row["sts_L"] = sts_l
+        delta_row["sts_R"] = sts_r
+        delta_row["has_sts_L"] = float(sts_l >= 10) if not np.isnan(sts_l) else np.nan
+        delta_row["has_sts_R"] = float(sts_r >= 10) if not np.isnan(sts_r) else np.nan
+
+        rows.append(delta_row)
+
+    return pd.DataFrame(rows, index=df.index)
+
+
+# ─── Preprocessing ────────────────────────────────────────────────────────────
 
 def preprocess(
     feature_df: pd.DataFrame,
@@ -116,10 +221,8 @@ def preprocess(
     """
     Impute les NaN puis standardise les features.
 
-    Si fit=True, ajuste l'imputer et le scaler sur les données fournies.
-    Si fit=False, applique des transformations existantes (jeu de test).
-
-    Retourne (X, scaler, imputer).
+    fit=True  : ajuste l'imputer et le scaler (jeu d'entraînement).
+    fit=False : applique les transformations existantes (jeu de test).
     """
     if imputer is None:
         imputer = SimpleImputer(strategy="median")

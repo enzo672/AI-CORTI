@@ -6,9 +6,22 @@ __pycache__/
 dist/
 build/
 .ipynb_checkpoints/
-*.env
 .env
 .claude/
+
+# Données locales (récupérées depuis MongoDB)
 data/raw/
+data/processed/
+*.csv
+*.parquet
+*.bson
+
+# Modèles entraînés
 *.h5
 *.pkl
+*.pt
+*.pth
+models/saved/
+
+# MongoDB
+mongodump/

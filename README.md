@@ -89,11 +89,21 @@ Chaque point est un tableau de 5 valeurs :
 |---|---|---|
 | 0 | `dB` | Seuil auditif mesuré (décibels HL) |
 | 1 | `fréquence` | Fréquence testée en Hz (ex : 500, 1000...) |
-| 2 | `transducteur` | Type : 1 = aérien (casque), 2 = osseux (vibrateur) |
-| 3 | `?` | Réservé (actuellement 0) |
-| 4 | `masked` | `true` si la mesure a été faite avec masquage contralateral |
+| 2 | `dot_category` | **1 = points du rapport courant** (conservés), 3 = rapport précédent (affichés en gris dans l'UI, ignorés) |
+| 3 | réservé | Toujours 0 |
+| 4 | `no_response` | `true` = pas de réponse du patient (point invalide, exclu), `false` = réponse valide |
+
+> **Corti → toujours non masqué.** L'index 4 indique uniquement l'absence de réponse, pas un masquage controlatéral.
 
 **Important :** les fréquences testées ne sont pas toujours les mêmes entre records (ex : 375 Hz, 1500 Hz, 3000 Hz). Une étape d'**interpolation** est nécessaire pour aligner tous les records sur les fréquences standard.
+
+### Catégorie de visite (`visit_category`)
+
+| Valeur | Signification |
+|---|---|
+| `0` | **Baseline** — référence initiale du patient |
+| `1` | **Periodic** — suivi régulier |
+| `2` | **Depart** — bilan de sortie |
 
 ---
 
@@ -116,8 +126,7 @@ odyo_anomaly/
 │   ├── evaluate.py           # Visualisation et métriques
 │   └── models/
 │       ├── __init__.py
-│       ├── unsupervised.py   # Isolation Forest + Autoencoder + PCA
-│       └── supervised.py     # XGBoost + Random Forest + One-Class SVM
+│       └── unsupervised.py   # Isolation Forest + Autoencoder + PCA
 │
 ├── requirements.txt
 └── README.md
@@ -148,21 +157,13 @@ Pipeline non supervisé (ne nécessite pas de labels) :
 - `PCA reconstruction error` : baseline rapide par compression linéaire
 - **Consensus** : flagge une anomalie si au moins 2 méthodes sur 3 sont d'accord
 
-#### `src/models/supervised.py`
-Pipeline supervisé (nécessite des labels dans `category`) :
-- `XGBoost` : boosting de gradient, gestion du déséquilibre par `scale_pos_weight`
-- `RandomForest` : bagging, interprétable via `feature_importances_`
-- `One-Class SVM` : entraîné uniquement sur les cas normaux (semi-supervisé)
-- Validation croisée stratifiée (5-fold) avec Precision, Recall, F1, ROC-AUC
-
 #### `src/evaluate.py`
 Visualisation des résultats :
 - Histogramme des scores d'anomalie avec seuil
 - Audiogramme standard (courbe OG × / courbe OD ○, axe Y inversé)
 - Top-N audiogrammes les plus anormaux
-- Projection UMAP 2D colorée par score ou label
-- Matrice de confusion et courbe ROC (mode supervisé)
-- Importance des features (mode supervisé)
+- Projection UMAP 2D colorée par score d'anomalie
+- Heatmap des deltas vs Baseline, distribution des STS
 
 ---
 
@@ -207,16 +208,21 @@ Le notebook guide à travers toutes les étapes : chargement, exploration, featu
 
 ```python
 from src.loader import load_dataset
-from src.features import build_feature_matrix, preprocess
+from src.features import build_feature_matrix, build_delta_features, preprocess
 from src.models.unsupervised import run_unsupervised_pipeline
-from src.evaluate import summary_report, plot_umap
+from src.evaluate import summary_report, plot_umap, plot_patient_trajectory
 
-# Charger les données
+# Charger les données (triées par patient + date)
 df = load_dataset('data/raw/')
 
-# Construire les features
+# ── Mode absolu (tous les records) ──
 feature_df, feature_cols = build_feature_matrix(df)
 X, scaler, imputer = preprocess(feature_df, fit=True)
+
+# ── Mode delta (Periodic/Depart vs Baseline, recommandé) ──
+delta_df = build_delta_features(df)
+delta_mask = delta_df['delta_PTA_L'].notna()
+X_delta, scaler_d, imputer_d = preprocess(delta_df[delta_mask], fit=True)
 
 # Pipeline non supervisé
 scores_df, if_model, ae_model = run_unsupervised_pipeline(X, contamination=0.05)
@@ -224,8 +230,9 @@ scores_df, if_model, ae_model = run_unsupervised_pipeline(X, contamination=0.05)
 # Résumé
 summary_report(df, scores_df)
 
-# Visualisation UMAP
-plot_umap(X, scores_df['reconstruction_error'].values)
+# Trajectoire d'un patient
+plot_patient_trajectory(df, patient=df['patient'].iloc[0])
+
 ```
 
 ---
@@ -266,46 +273,9 @@ Un record est marqué **anomalie de consensus** si au moins 2 méthodes sur 3 le
 
 ---
 
-## Pipeline supervisé — Détail
-
-Utilisé quand le champ `category` contient des labels de pathologie confirmés.
-
-### Prérequis
-
-Il faut d'abord vérifier que `category` encode bien une information utile :
-```python
-df['category'].value_counts()
-```
-
-Si `category` distingue cas normaux (0) et anomalies (1 ou plus), binariser :
-```python
-y = (df['category'] != 0).astype(int)
-```
-
-### XGBoost (recommandé)
-
-Gradient boosting : entraîne des arbres séquentiellement, chacun corrigeant les erreurs du précédent. Gère le déséquilibre de classes via `scale_pos_weight = n_normaux / n_anomalies`.
-
-### Random Forest
-
-Bagging d'arbres de décision. Plus interprétable via `feature_importances_` — utile pour comprendre quelles fréquences sont les plus discriminantes cliniquement.
-
-### Évaluation
-
-La validation croisée **stratifiée** (5-fold) garantit que chaque fold contient une proportion représentative d'anomalies :
-
-| Métrique | Description |
-|---|---|
-| **Precision** | Parmi les records flaggés anomalie, quelle fraction l'est vraiment ? |
-| **Recall** | Parmi les vraies anomalies, quelle fraction a été détectée ? |
-| **F1** | Moyenne harmonique Precision/Recall |
-| **ROC-AUC** | Capacité à discriminer normal/anomalie (1.0 = parfait) |
-
-**En contexte médical, le Recall (sensibilité) est souvent prioritaire** : mieux vaut un faux positif qu'une anomalie manquée.
-
----
-
 ## Features construites
+
+### Features absolues (par record)
 
 | Feature | Description | Calcul |
 |---|---|---|
@@ -316,12 +286,31 @@ La validation croisée **stratifiée** (5-fold) garantit que chaque fold contien
 | `high_freq_drop_L` | Chute HF oreille gauche | dB(8000) − dB(4000) |
 | `high_freq_drop_R` | Chute HF oreille droite | dB(8000) − dB(4000) |
 | `asymmetry_mean` | Asymétrie inter-oreilles | Moyenne(\|OG − OD\|) |
-| `hearing_line` | Seuil de référence du rapport | Champ `hearingLine` |
+| `hearing_line` | Seuil de référence du rapport | Champ `hearingLine` (25 fixe pour Corti) |
 | `evaluation_mode` | Mode d'évaluation | Champ `evaluationMode` |
 | `n_freqs_left` | Nb fréquences testées OG | `len(dots.left)` |
 | `n_freqs_right` | Nb fréquences testées OD | `len(dots.right)` |
 
-**Total : 19 features** (6+6 seuils + 7 features dérivées)
+**Total : 19 features absolues**
+
+### Features delta (Periodic / Depart vs Baseline du même patient)
+
+Calculées uniquement pour les records dont le patient a un Baseline. Normalisent la variabilité inter-individuelle — cliniquement plus robustes.
+
+| Feature | Description | Calcul |
+|---|---|---|
+| `delta_L_250` … `delta_L_8000` | Shift OG par fréquence | seuil courant − seuil Baseline |
+| `delta_R_250` … `delta_R_8000` | Shift OD par fréquence | seuil courant − seuil Baseline |
+| `delta_PTA_L` | Évolution du PTA OG | PTA courant − PTA Baseline |
+| `delta_PTA_R` | Évolution du PTA OD | PTA courant − PTA Baseline |
+| `delta_high_freq_drop_L/R` | Évolution de la chute HF | — |
+| `delta_asymmetry` | Évolution de l'asymétrie | — |
+| `sts_L` | Standard Threshold Shift OG | Shift moyen à 2000/3000/4000 Hz |
+| `sts_R` | Standard Threshold Shift OD | Shift moyen à 2000/3000/4000 Hz |
+| `has_sts_L` | Flag STS OG ≥ 10 dB | Critère OSHA |
+| `has_sts_R` | Flag STS OD ≥ 10 dB | Critère OSHA |
+
+**Total : 26 features delta**
 
 ---
 
@@ -342,7 +331,44 @@ La validation croisée **stratifiée** (5-fold) garantit que chaque fold contien
 | `scipy` | Interpolation des seuils |
 | `scikit-learn` | Isolation Forest, PCA, preprocessing, métriques |
 | `torch` | Autoencoder (détection non supervisée deep learning) |
-| `xgboost` | Classification supervisée |
 | `matplotlib`, `seaborn` | Visualisations |
 | `umap-learn` | Réduction dimensionnelle pour visualisation |
 | `jupyter` | Notebooks d'exploration |
+
+
+## Category of the data (Corti Software)
+
+0 -> Baseline 
+1 -> Periodic 
+2 -> Depart 
+
+VisitDate 
+
+Grey dots -> previous (version) . 
+
+version audiogramme : 
+1 -> previous 
+3 -> Baseline dots 
+
+snapshot : patient -> Date of birth , Gender. 
+baseline : Id, dots, visit date 
+prevReport : Id, dots, visit date 
+
+DATA (left and right): 
+object audiogramme -> 
+      Dots is an array of 5 numbers . (Intensity,frequency, Category (1 -> current report, 3 -> previous), index 3 always 0 , index 4 (True -> No response, False -> Response)) []
+
+Corty -> always unmasked 
+
+Classe (MSP ) : 
+
+score f1 (parfois f2) dans les 2 oreilles a recupérer. 
+
+Classe (STS ) : 
+
+hearing line (25 fixed for CORTI)
+
+
++ Note 
+
+
