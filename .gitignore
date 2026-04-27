@@ -12,6 +12,7 @@ build/
 # Données locales (récupérées depuis MongoDB)
 data/raw/
 data/processed/
+data/normalized/
 *.csv
 *.parquet
 *.bson
@@ -21,7 +22,14 @@ data/processed/
 *.pkl
 *.pt
 *.pth
+*.joblib
 models/saved/
+
+# Résultats générés (scores, figures, modèles exportés)
+results/
+
+# Rapports JSON bruts (données patients)
+JSON reports/
 
 # MongoDB
 mongodump/
