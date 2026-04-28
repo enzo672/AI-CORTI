@@ -16,6 +16,7 @@ data/normalized/
 *.csv
 *.parquet
 *.bson
+*.json
 
 # Modèles entraînés
 *.h5
@@ -30,6 +31,9 @@ results/
 
 # Rapports JSON bruts (données patients)
 JSON reports/
+
+# Présentations et données sensibles
+*.pdf
 
 # MongoDB
 mongodump/

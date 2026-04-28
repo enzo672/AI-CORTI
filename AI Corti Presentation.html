@@ -1,0 +1,2033 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>AI CORTI — Présentation projet IA 2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>
+/**
+ * <deck-stage> — reusable web component for HTML decks.
+ *
+ * Handles:
+ *  (a) speaker notes — reads <script type="application/json" id="speaker-notes">
+ *      and posts {slideIndexChanged: N} to the parent window on nav.
+ *  (b) keyboard navigation — ←/→, PgUp/PgDn, Space, Home/End, number keys.
+ *  (c) press R to reset to slide 0 (with a tasteful keyboard hint).
+ *  (d) bottom-center overlay showing slide count + hints, fades out on idle.
+ *  (e) auto-scaling — inner canvas is a fixed design size (default 1920×1080)
+ *      scaled with `transform: scale()` to fit the viewport, letterboxed.
+ *      Set the `noscale` attribute to render at authored size (1:1) — the
+ *      PPTX exporter sets this so its DOM capture sees unscaled geometry.
+ *  (f) print — `@media print` lays every slide out as its own page at the
+ *      design size, so the browser's Print → Save as PDF produces a clean
+ *      one-page-per-slide PDF with no extra setup.
+ *
+ * Slides are HIDDEN, not unmounted. Non-active slides stay in the DOM with
+ * `visibility: hidden` + `opacity: 0`, so their state (videos, iframes,
+ * form inputs, React trees) is preserved across navigation.
+ *
+ * Lifecycle event — the component dispatches a `slidechange` CustomEvent on
+ * itself whenever the active slide changes (including the initial mount).
+ * The event bubbles and composes out of shadow DOM, so you can listen on
+ * the <deck-stage> element or on document:
+ *
+ *   document.querySelector('deck-stage').addEventListener('slidechange', (e) => {
+ *     e.detail.index         // new 0-based index
+ *     e.detail.previousIndex // previous index, or -1 on init
+ *     e.detail.total         // total slide count
+ *     e.detail.slide         // the new active slide element
+ *     e.detail.previousSlide // the prior slide element, or null on init
+ *     e.detail.reason        // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+ *   });
+ *
+ * Persistence: none at the deck level. The host app keeps the current slide
+ * in its own URL (?slide=) and re-delivers it via location.hash on load, so a
+ * bare load with no hash always starts at slide 1.
+ *
+ * Usage:
+ *   <deck-stage width="1920" height="1080">
+ *     <section data-label="Title">...</section>
+ *     <section data-label="Agenda">...</section>
+ *   </deck-stage>
+ *
+ * Slides are the direct element children of <deck-stage>. Each slide is
+ * automatically tagged with:
+ *   - data-screen-label="NN Label"   (1-indexed, for comment flow)
+ *   - data-om-validate="no_overflowing_text,no_overlapping_text,slide_sized_text"
+ */
+
+(() => {
+  const DESIGN_W_DEFAULT = 1920;
+  const DESIGN_H_DEFAULT = 1080;
+  const OVERLAY_HIDE_MS = 1800;
+  const VALIDATE_ATTR = 'no_overflowing_text,no_overlapping_text,slide_sized_text';
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+
+  const stylesheet = `
+    :host {
+      position: fixed;
+      inset: 0;
+      display: block;
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    .stage {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .canvas {
+      position: relative;
+      transform-origin: center center;
+      flex-shrink: 0;
+      background: #fff;
+      will-change: transform;
+    }
+
+    /* Slides live in light DOM (via <slot>) so authored CSS still applies.
+       We absolutely position each slotted child to stack them. */
+    ::slotted(*) {
+      position: absolute !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      box-sizing: border-box !important;
+      overflow: hidden;
+      opacity: 0;
+      pointer-events: none;
+      visibility: hidden;
+    }
+    ::slotted([data-deck-active]) {
+      opacity: 1;
+      pointer-events: auto;
+      visibility: visible;
+    }
+
+    /* Tap zones for mobile — back/forward thirds like Stories.
+       Transparent, no visible UI, don't block the overlay. */
+    .tapzones {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      z-index: 2147482000;
+      pointer-events: none;
+    }
+    .tapzone {
+      flex: 1;
+      pointer-events: auto;
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* Only activate tap zones on coarse pointers (touch devices). */
+    @media (hover: hover) and (pointer: fine) {
+      .tapzones { display: none; }
+    }
+
+    .overlay {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translate(-50%, 6px) scale(0.92);
+      filter: blur(6px);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px;
+      background: #000;
+      color: #fff;
+      border-radius: 999px;
+      font-size: 12px;
+      font-feature-settings: "tnum" 1;
+      letter-spacing: 0.01em;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 260ms ease, transform 260ms cubic-bezier(.2,.8,.2,1), filter 260ms ease;
+      transform-origin: center bottom;
+      z-index: 2147483000;
+      user-select: none;
+    }
+    .overlay[data-visible] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translate(-50%, 0) scale(1);
+      filter: blur(0);
+    }
+
+    .btn {
+      appearance: none;
+      -webkit-appearance: none;
+      background: transparent;
+      border: 0;
+      margin: 0;
+      padding: 0;
+      color: inherit;
+      font: inherit;
+      cursor: default;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 28px;
+      min-width: 28px;
+      border-radius: 999px;
+      color: rgba(255,255,255,0.72);
+      transition: background 140ms ease, color 140ms ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+    .btn:active { background: rgba(255,255,255,0.18); }
+    .btn:focus { outline: none; }
+    .btn:focus-visible { outline: none; }
+    .btn::-moz-focus-inner { border: 0; }
+    .btn svg { width: 14px; height: 14px; display: block; }
+    .btn.reset {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      padding: 0 10px 0 12px;
+      gap: 6px;
+      color: rgba(255,255,255,0.72);
+    }
+    .btn.reset .kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 16px;
+      height: 16px;
+      padding: 0 4px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 10px;
+      line-height: 1;
+      color: rgba(255,255,255,0.88);
+      background: rgba(255,255,255,0.12);
+      border-radius: 4px;
+    }
+
+    .count {
+      font-variant-numeric: tabular-nums;
+      color: #fff;
+      font-weight: 500;
+      padding: 0 8px;
+      min-width: 42px;
+      text-align: center;
+      font-size: 12px;
+    }
+    .count .sep { color: rgba(255,255,255,0.45); margin: 0 3px; font-weight: 400; }
+    .count .total { color: rgba(255,255,255,0.55); }
+
+    .divider {
+      width: 1px;
+      height: 14px;
+      background: rgba(255,255,255,0.18);
+      margin: 0 2px;
+    }
+
+    /* ── Print: one page per slide, no chrome ────────────────────────────
+       The screen layout stacks every slide at inset:0 inside a scaled
+       canvas; for print we want them in document flow at the authored
+       design size so the browser paginates one slide per sheet. The
+       @page size is set from the width/height attributes via the inline
+       <style id="deck-stage-print-page"> that connectedCallback injects
+       into <head> (the @page at-rule has no effect inside shadow DOM). */
+    @media print {
+      :host {
+        position: static;
+        inset: auto;
+        background: none;
+        overflow: visible;
+        color: inherit;
+      }
+      .stage { position: static; display: block; }
+      .canvas {
+        transform: none !important;
+        width: auto !important;
+        height: auto !important;
+        background: none;
+        will-change: auto;
+      }
+      ::slotted(*) {
+        position: relative !important;
+        inset: auto !important;
+        width: var(--deck-design-w) !important;
+        height: var(--deck-design-h) !important;
+        box-sizing: border-box !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        pointer-events: auto;
+        break-after: page;
+        page-break-after: always;
+        break-inside: avoid;
+        overflow: hidden;
+      }
+      ::slotted(*:last-child) {
+        break-after: auto;
+        page-break-after: auto;
+      }
+      .overlay, .tapzones { display: none !important; }
+    }
+  `;
+
+  class DeckStage extends HTMLElement {
+    static get observedAttributes() { return ['width', 'height', 'noscale']; }
+
+    constructor() {
+      super();
+      this._root = this.attachShadow({ mode: 'open' });
+      this._index = 0;
+      this._slides = [];
+      this._notes = [];
+      this._hideTimer = null;
+      this._mouseIdleTimer = null;
+
+      this._onKey = this._onKey.bind(this);
+      this._onResize = this._onResize.bind(this);
+      this._onSlotChange = this._onSlotChange.bind(this);
+      this._onMouseMove = this._onMouseMove.bind(this);
+      this._onTapBack = this._onTapBack.bind(this);
+      this._onTapForward = this._onTapForward.bind(this);
+    }
+
+    get designWidth() {
+      return parseInt(this.getAttribute('width'), 10) || DESIGN_W_DEFAULT;
+    }
+    get designHeight() {
+      return parseInt(this.getAttribute('height'), 10) || DESIGN_H_DEFAULT;
+    }
+
+    connectedCallback() {
+      this._render();
+      this._loadNotes();
+      this._syncPrintPageRule();
+      window.addEventListener('keydown', this._onKey);
+      window.addEventListener('resize', this._onResize);
+      window.addEventListener('mousemove', this._onMouseMove, { passive: true });
+      // Initial collection + layout happens via slotchange, which fires on mount.
+    }
+
+    disconnectedCallback() {
+      window.removeEventListener('keydown', this._onKey);
+      window.removeEventListener('resize', this._onResize);
+      window.removeEventListener('mousemove', this._onMouseMove);
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      if (this._mouseIdleTimer) clearTimeout(this._mouseIdleTimer);
+    }
+
+    attributeChangedCallback() {
+      if (this._canvas) {
+        this._canvas.style.width = this.designWidth + 'px';
+        this._canvas.style.height = this.designHeight + 'px';
+        this._canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+        this._canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+        this._fit();
+        this._syncPrintPageRule();
+      }
+    }
+
+    _render() {
+      const style = document.createElement('style');
+      style.textContent = stylesheet;
+
+      const stage = document.createElement('div');
+      stage.className = 'stage';
+
+      const canvas = document.createElement('div');
+      canvas.className = 'canvas';
+      canvas.style.width = this.designWidth + 'px';
+      canvas.style.height = this.designHeight + 'px';
+      canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+      canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+
+      const slot = document.createElement('slot');
+      slot.addEventListener('slotchange', this._onSlotChange);
+      canvas.appendChild(slot);
+      stage.appendChild(canvas);
+
+      // Tap zones (mobile): left third = back, right third = forward.
+      const tapzones = document.createElement('div');
+      tapzones.className = 'tapzones export-hidden';
+      tapzones.setAttribute('aria-hidden', 'true');
+      tapzones.setAttribute('data-noncommentable', '');
+      const tzBack = document.createElement('div');
+      tzBack.className = 'tapzone tapzone--back';
+      const tzMid = document.createElement('div');
+      tzMid.className = 'tapzone tapzone--mid';
+      tzMid.style.pointerEvents = 'none';
+      const tzFwd = document.createElement('div');
+      tzFwd.className = 'tapzone tapzone--fwd';
+      tzBack.addEventListener('click', this._onTapBack);
+      tzFwd.addEventListener('click', this._onTapForward);
+      tapzones.append(tzBack, tzMid, tzFwd);
+
+      // Overlay: compact, solid black, with clickable controls.
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay export-hidden';
+      overlay.setAttribute('role', 'toolbar');
+      overlay.setAttribute('aria-label', 'Deck controls');
+      overlay.setAttribute('data-noncommentable', '');
+      overlay.innerHTML = `
+        <button class="btn prev" type="button" aria-label="Previous slide" title="Previous (←)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>
+        </button>
+        <span class="count" aria-live="polite"><span class="current">1</span><span class="sep">/</span><span class="total">1</span></span>
+        <button class="btn next" type="button" aria-label="Next slide" title="Next (→)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>
+        </button>
+        <span class="divider"></span>
+        <button class="btn reset" type="button" aria-label="Reset to first slide" title="Reset (R)">Reset<span class="kbd">R</span></button>
+      `;
+
+      overlay.querySelector('.prev').addEventListener('click', () => this._go(this._index - 1, 'click'));
+      overlay.querySelector('.next').addEventListener('click', () => this._go(this._index + 1, 'click'));
+      overlay.querySelector('.reset').addEventListener('click', () => this._go(0, 'click'));
+
+      this._root.append(style, stage, tapzones, overlay);
+      this._canvas = canvas;
+      this._slot = slot;
+      this._overlay = overlay;
+      this._countEl = overlay.querySelector('.current');
+      this._totalEl = overlay.querySelector('.total');
+    }
+
+    /** @page must live in the document stylesheet — it's a no-op inside
+     *  shadow DOM. Inject/update a single <head> style tag so the print
+     *  sheet matches the design size and Save-as-PDF yields one slide per
+     *  page with no margins. */
+    _syncPrintPageRule() {
+      const id = 'deck-stage-print-page';
+      let tag = document.getElementById(id);
+      if (!tag) {
+        tag = document.createElement('style');
+        tag.id = id;
+        document.head.appendChild(tag);
+      }
+      tag.textContent =
+        '@page { size: ' + this.designWidth + 'px ' + this.designHeight + 'px; margin: 0; } ' +
+        '@media print { html, body { margin: 0 !important; padding: 0 !important; background: none !important; overflow: visible !important; height: auto !important; } ' +
+        '* { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }';
+    }
+
+    _onSlotChange() {
+      this._collectSlides();
+      this._restoreIndex();
+      this._applyIndex({ showOverlay: false, broadcast: true, reason: 'init' });
+      this._fit();
+    }
+
+    _collectSlides() {
+      const assigned = this._slot.assignedElements({ flatten: true });
+      this._slides = assigned.filter((el) => {
+        // Skip template/style/script nodes even if someone slots them.
+        const tag = el.tagName;
+        return tag !== 'TEMPLATE' && tag !== 'SCRIPT' && tag !== 'STYLE';
+      });
+
+      this._slides.forEach((slide, i) => {
+        const n = i + 1;
+        // Determine a label for comment flow: prefer explicit data-label,
+        // then an existing data-screen-label, then first heading, else "Slide".
+        let label = slide.getAttribute('data-label');
+        if (!label) {
+          const existing = slide.getAttribute('data-screen-label');
+          if (existing) {
+            // Strip any leading number the author may have included.
+            label = existing.replace(/^\s*\d+\s*/, '').trim() || existing;
+          }
+        }
+        if (!label) {
+          const h = slide.querySelector('h1, h2, h3, [data-title]');
+          if (h) label = (h.textContent || '').trim().slice(0, 40);
+        }
+        if (!label) label = 'Slide';
+        slide.setAttribute('data-screen-label', `${pad2(n)} ${label}`);
+
+        // Validation attribute for comment flow / auto-checks.
+        if (!slide.hasAttribute('data-om-validate')) {
+          slide.setAttribute('data-om-validate', VALIDATE_ATTR);
+        }
+
+        slide.setAttribute('data-deck-slide', String(i));
+      });
+
+      if (this._totalEl) this._totalEl.textContent = String(this._slides.length || 1);
+      if (this._index >= this._slides.length) this._index = Math.max(0, this._slides.length - 1);
+    }
+
+    _loadNotes() {
+      const tag = document.getElementById('speaker-notes');
+      if (!tag) { this._notes = []; return; }
+      try {
+        const parsed = JSON.parse(tag.textContent || '[]');
+        if (Array.isArray(parsed)) this._notes = parsed;
+      } catch (e) {
+        console.warn('[deck-stage] Failed to parse #speaker-notes JSON:', e);
+        this._notes = [];
+      }
+    }
+
+    _restoreIndex() {
+      // The host's ?slide= param is delivered as a #<int> hash (1-indexed) on
+      // the iframe src. No hash → slide 1; the deck itself keeps no position
+      // state across loads.
+      const h = (location.hash || '').match(/^#(\d+)$/);
+      if (h) {
+        const n = parseInt(h[1], 10) - 1;
+        if (n >= 0 && n < this._slides.length) this._index = n;
+      }
+    }
+
+    _applyIndex({ showOverlay = true, broadcast = true, reason = 'init' } = {}) {
+      if (!this._slides.length) return;
+      const prev = this._prevIndex == null ? -1 : this._prevIndex;
+      const curr = this._index;
+      // Keep the iframe's own hash in sync so an in-iframe location.reload()
+      // (reload banner path in viewer-handle.ts) lands on the current slide,
+      // not the stale deep-link hash from initial load.
+      try { history.replaceState(null, '', '#' + (curr + 1)); } catch (e) {}
+      this._slides.forEach((s, i) => {
+        if (i === curr) s.setAttribute('data-deck-active', '');
+        else s.removeAttribute('data-deck-active');
+      });
+      if (this._countEl) this._countEl.textContent = String(curr + 1);
+
+      if (broadcast) {
+        // (1) Legacy: host-window postMessage for speaker-notes renderers.
+        try { window.postMessage({ slideIndexChanged: curr }, '*'); } catch (e) {}
+
+        // (2) In-page CustomEvent on the <deck-stage> element itself.
+        //     Bubbles and composes out of shadow DOM so slide code can listen:
+        //       document.querySelector('deck-stage').addEventListener('slidechange', e => {
+        //         e.detail.index, e.detail.previousIndex, e.detail.total, e.detail.slide, e.detail.reason
+        //       });
+        const detail = {
+          index: curr,
+          previousIndex: prev,
+          total: this._slides.length,
+          slide: this._slides[curr] || null,
+          previousSlide: prev >= 0 ? (this._slides[prev] || null) : null,
+          reason: reason, // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+        };
+        this.dispatchEvent(new CustomEvent('slidechange', {
+          detail,
+          bubbles: true,
+          composed: true,
+        }));
+      }
+
+      this._prevIndex = curr;
+      if (showOverlay) this._flashOverlay();
+    }
+
+    _flashOverlay() {
+      if (!this._overlay) return;
+      this._overlay.setAttribute('data-visible', '');
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      this._hideTimer = setTimeout(() => {
+        this._overlay.removeAttribute('data-visible');
+      }, OVERLAY_HIDE_MS);
+    }
+
+    _fit() {
+      if (!this._canvas) return;
+      // PPTX export sets noscale so the DOM capture sees authored-size
+      // geometry — the scaled canvas is in shadow DOM, so the exporter's
+      // resetTransformSelector can't reach .canvas.style.transform directly.
+      if (this.hasAttribute('noscale')) {
+        this._canvas.style.transform = 'none';
+        return;
+      }
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const s = Math.min(vw / this.designWidth, vh / this.designHeight);
+      this._canvas.style.transform = `scale(${s})`;
+    }
+
+    _onResize() { this._fit(); }
+
+    _onMouseMove() {
+      // Keep overlay visible while mouse moves; hide after idle.
+      this._flashOverlay();
+    }
+
+    _onTapBack(e) {
+      e.preventDefault();
+      this._go(this._index - 1, 'tap');
+    }
+
+    _onTapForward(e) {
+      e.preventDefault();
+      this._go(this._index + 1, 'tap');
+    }
+
+    _onKey(e) {
+      // Ignore when the user is typing.
+      const t = e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const key = e.key;
+      let handled = true;
+
+      if (key === 'ArrowRight' || key === 'PageDown' || key === ' ' || key === 'Spacebar') {
+        this._go(this._index + 1, 'keyboard');
+      } else if (key === 'ArrowLeft' || key === 'PageUp') {
+        this._go(this._index - 1, 'keyboard');
+      } else if (key === 'Home') {
+        this._go(0, 'keyboard');
+      } else if (key === 'End') {
+        this._go(this._slides.length - 1, 'keyboard');
+      } else if (key === 'r' || key === 'R') {
+        this._go(0, 'keyboard');
+      } else if (/^[0-9]$/.test(key)) {
+        // 1..9 jump to that slide; 0 jumps to 10.
+        const n = key === '0' ? 9 : parseInt(key, 10) - 1;
+        if (n < this._slides.length) this._go(n, 'keyboard');
+      } else {
+        handled = false;
+      }
+
+      if (handled) {
+        e.preventDefault();
+        this._flashOverlay();
+      }
+    }
+
+    _go(i, reason = 'api') {
+      if (!this._slides.length) return;
+      const clamped = Math.max(0, Math.min(this._slides.length - 1, i));
+      if (clamped === this._index) {
+        this._flashOverlay();
+        return;
+      }
+      this._index = clamped;
+      this._applyIndex({ showOverlay: true, broadcast: true, reason });
+    }
+
+    // Public API ------------------------------------------------------------
+
+    /** Current slide index (0-based). */
+    get index() { return this._index; }
+    /** Total slide count. */
+    get length() { return this._slides.length; }
+    /** Programmatically navigate. */
+    goTo(i) { this._go(i, 'api'); }
+    next() { this._go(this._index + 1, 'api'); }
+    prev() { this._go(this._index - 1, 'api'); }
+    reset() { this._go(0, 'api'); }
+  }
+
+  if (!customElements.get('deck-stage')) {
+    customElements.define('deck-stage', DeckStage);
+  }
+})();
+
+</script>
+<style>
+  :root {
+    --odyo-blue:        #4A86C5;
+    --odyo-blue-deep:   #2E6BA8;
+    --odyo-blue-soft:   #E8F0F9;
+    --odyo-blue-mist:   #F5F9FD;
+    --ink:              #1A2332;
+    --ink-soft:         #4A5666;
+    --ink-mute:         #8593A4;
+    --line:             #DCE5EE;
+    --line-soft:        #EEF2F7;
+    --paper:            #FFFFFF;
+    --paper-tint:       #FAFBFD;
+    --accent-warm:      #C77B5C;
+    --accent-alert:     #B85450;
+    --accent-ok:        #6B9B6E;
+  }
+
+  html, body {
+    margin: 0; padding: 0;
+    background: #0A0E14;
+    font-family: 'Manrope', system-ui, sans-serif;
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  deck-stage > section {
+    background: var(--paper);
+    color: var(--ink);
+    box-sizing: border-box;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* Persistent header (logo + section indicator) */
+  .slide-header {
+    position: absolute;
+    top: 56px;
+    left: 100px;
+    right: 100px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    z-index: 10;
+  }
+  .slide-header .logo {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .slide-header .logo img {
+    width: 156px;
+    height: 64px;
+    object-fit: contain;
+    object-position: left center;
+    background: #FFFFFF;
+    padding: 6px 12px;
+    border-radius: 8px;
+    box-sizing: content-box;
+  }
+  .slide-header .logo .meta {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.1;
+  }
+  .slide-header .logo .meta .product {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    color: var(--odyo-blue-deep);
+  }
+  .slide-header .logo .meta .sub {
+    font-size: 24px;
+    font-weight: 500;
+    letter-spacing: 0.22em;
+    color: var(--ink-mute);
+    text-transform: uppercase;
+    margin-top: 4px;
+  }
+  .slide-header .crumb {
+    font-size: 24px;
+    font-weight: 500;
+    letter-spacing: 0.18em;
+    color: var(--ink-mute);
+    text-transform: uppercase;
+  }
+
+  /* Slide body container */
+  .slide-body {
+    position: absolute;
+    top: 188px;
+    left: 100px;
+    right: 100px;
+    bottom: 80px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Titles */
+  .eyebrow {
+    font-size: 24px;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--odyo-blue);
+    margin-bottom: 24px;
+  }
+  h1.title {
+    font-size: 64px;
+    font-weight: 700;
+    line-height: 1.1;
+    color: var(--ink);
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  h2.subtitle {
+    font-size: 32px;
+    font-weight: 400;
+    line-height: 1.3;
+    color: var(--ink-soft);
+    margin: 18px 0 0 0;
+    letter-spacing: -0.005em;
+  }
+  .title-rule {
+    width: 80px;
+    height: 4px;
+    background: var(--odyo-blue);
+    border-radius: 2px;
+    margin-top: 32px;
+  }
+
+  /* Body text */
+  p.body {
+    font-size: 28px;
+    line-height: 1.5;
+    color: var(--ink-soft);
+    margin: 0;
+  }
+
+  /* Hide the deck-stage built-in counter; we use crumb */
+  /* (the component overlay is fine; keep) */
+
+  /* Cover slide */
+  .cover {
+    background: linear-gradient(180deg, #FFFFFF 0%, var(--odyo-blue-mist) 100%) !important;
+  }
+  .cover-grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(var(--line-soft) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+    background-size: 80px 80px;
+    opacity: 0.5;
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
+  }
+  .cover-content {
+    position: absolute;
+    left: 100px; right: 100px;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+  .cover-content .logo-big {
+    display: flex; align-items: center; gap: 24px; margin-bottom: 56px;
+  }
+  .cover-content .logo-big img { width: 260px; height: 96px; object-fit: contain; object-position: left center; background: #FFFFFF; padding: 10px 18px; border-radius: 10px; box-sizing: content-box; }
+  .cover-content .logo-big .meta .product { font-size: 28px; font-weight: 700; letter-spacing: 0.18em; color: var(--odyo-blue-deep); }
+  .cover-content .logo-big .meta .sub { font-size: 24px; font-weight: 500; letter-spacing: 0.22em; color: var(--ink-mute); text-transform: uppercase; margin-top: 6px; }
+  .cover h1.cover-title {
+    font-size: 144px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    line-height: 0.95;
+    color: var(--ink);
+    margin: 0;
+  }
+  .cover .cover-sub {
+    font-size: 38px;
+    font-weight: 400;
+    line-height: 1.3;
+    color: var(--ink-soft);
+    margin: 28px 0 0 0;
+    max-width: 1200px;
+  }
+  .cover .cover-tags {
+    display: flex; gap: 14px; margin-top: 56px;
+  }
+  .cover .cover-tags span {
+    font-size: 24px;
+    font-weight: 500;
+    padding: 12px 22px;
+    border: 1px solid var(--odyo-blue);
+    color: var(--odyo-blue-deep);
+    border-radius: 999px;
+    background: rgba(255,255,255,0.6);
+    letter-spacing: 0.02em;
+  }
+  .cover-footer {
+    position: absolute;
+    bottom: 56px; left: 100px; right: 100px;
+    display: flex; justify-content: space-between; align-items: flex-end;
+    font-size: 24px; color: var(--ink-mute); letter-spacing: 0.1em; text-transform: uppercase;
+  }
+
+  /* Two-col layout */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 80px;
+    flex: 1;
+    align-items: stretch;
+  }
+  .three-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 40px;
+    flex: 1;
+  }
+  .four-col {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 28px;
+  }
+
+  /* Card */
+  .card {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 40px;
+    display: flex;
+    flex-direction: column;
+  }
+  .card.tinted {
+    background: var(--odyo-blue-mist);
+    border-color: var(--odyo-blue-soft);
+  }
+  .card h3 {
+    font-size: 30px;
+    font-weight: 700;
+    color: var(--ink);
+    margin: 0 0 12px 0;
+    letter-spacing: -0.005em;
+  }
+  .card .lede {
+    font-size: 24px;
+    font-weight: 500;
+    color: var(--odyo-blue-deep);
+    margin: 0 0 20px 0;
+    letter-spacing: 0.02em;
+  }
+  .card p {
+    font-size: 24px;
+    line-height: 1.5;
+    color: var(--ink-soft);
+    margin: 0;
+  }
+
+  /* Bullet list */
+  ul.clean {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+  }
+  ul.clean li {
+    font-size: 26px;
+    line-height: 1.45;
+    color: var(--ink-soft);
+    padding-left: 28px;
+    position: relative;
+  }
+  ul.clean li::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 16px;
+    width: 8px; height: 8px;
+    background: var(--odyo-blue);
+    border-radius: 2px;
+  }
+  ul.clean li strong { color: var(--ink); font-weight: 600; }
+
+  /* Section header slide */
+  .section-slide {
+    background: var(--odyo-blue-deep) !important;
+    color: white !important;
+  }
+  .section-slide .slide-header .logo .meta .product { color: white; }
+  .section-slide .slide-header .logo .meta .sub { color: rgba(255,255,255,0.6); }
+  .section-slide .slide-header .crumb { color: rgba(255,255,255,0.7); }
+  .section-slide .logo img { filter: brightness(0) invert(1); }
+
+  /* Step pill */
+  .step-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 56px; height: 56px;
+    background: var(--odyo-blue);
+    color: white;
+    font-size: 26px;
+    font-weight: 700;
+    border-radius: 14px;
+    margin-bottom: 20px;
+  }
+
+  /* Mono */
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  /* Page corner */
+  footer.page-foot {
+    position: absolute;
+    bottom: 36px; left: 100px; right: 100px;
+    display: flex; justify-content: space-between;
+    font-size: 24px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+  }
+</style>
+
+<style id="elegance-overrides">
+  :root {
+    --odyo-blue:        #2563A8;
+    --odyo-blue-deep:   #14365C;
+    --odyo-blue-soft:   #DCE7F2;
+    --odyo-blue-mist:   #F4F7FB;
+    --accent:           #1F4E7A;
+    --ink:              #0B1726;
+    --ink-soft:         #2F4055;
+    --ink-mute:         #6B7B91;
+    --line:             #E5EAF1;
+    --line-soft:        #F0F3F7;
+    --paper:            #FFFFFF;
+    --paper-tint:       #FAFBFD;
+  }
+  body, html { font-family: 'Inter', system-ui, sans-serif; }
+
+  /* Professional, restrained typography — no serif */
+  h1.title, h1.cover-title, .card h3, h2.subtitle {
+    font-family: 'Inter', system-ui, sans-serif !important;
+    font-style: normal !important;
+  }
+  h1.title {
+    font-weight: 700 !important;
+    letter-spacing: -0.02em !important;
+    color: var(--ink) !important;
+  }
+  h1.cover-title {
+    font-weight: 700 !important;
+    letter-spacing: -0.035em !important;
+    color: var(--ink) !important;
+    background: none !important;
+    -webkit-text-fill-color: var(--ink) !important;
+  }
+  h2.subtitle {
+    font-weight: 400 !important;
+    color: var(--ink-soft) !important;
+  }
+
+  /* Cover: pure white, refined hierarchy */
+  .cover { background: #FFFFFF !important; }
+  .cover-grid { display: none; }
+  .cover .cover-sub { color: var(--ink-soft); max-width: 1100px; }
+
+  /* Title rule — solid, sober */
+  .title-rule {
+    background: var(--odyo-blue-deep) !important;
+    width: 64px !important;
+    height: 2px !important;
+    border-radius: 0 !important;
+  }
+
+  /* Eyebrow — slate, not gold */
+  .eyebrow {
+    color: var(--odyo-blue-deep) !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.22em !important;
+    text-transform: uppercase;
+  }
+
+  /* Cards — flat, professional */
+  .card {
+    border-radius: 10px !important;
+    border: 1px solid var(--line) !important;
+    box-shadow: none !important;
+    background: var(--paper) !important;
+  }
+  .card.tinted {
+    background: var(--odyo-blue-mist) !important;
+    border: 1px solid var(--odyo-blue-soft) !important;
+  }
+  .card .lede {
+    color: var(--odyo-blue-deep) !important;
+    font-family: 'Inter', sans-serif !important;
+    text-transform: uppercase;
+    font-size: 24px !important;
+    letter-spacing: 0.2em !important;
+    font-weight: 600 !important;
+  }
+  .card.tinted .lede { color: var(--odyo-blue-deep) !important; }
+  .card h3 {
+    font-size: 30px !important;
+    color: var(--ink) !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.005em !important;
+  }
+
+  /* Header */
+  .slide-header .logo .meta .sub {
+    font-family: 'Inter', sans-serif !important;
+    font-size: 24px !important;
+    letter-spacing: 0.16em !important;
+    color: var(--ink-mute) !important;
+    font-weight: 500 !important;
+  }
+  .author-chip {
+    display: flex; flex-direction: column; align-items: flex-end;
+    gap: 4px;
+  }
+  .author-chip .name {
+    font-family: 'Inter', sans-serif;
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--ink);
+    letter-spacing: -0.005em;
+  }
+  .author-chip .role {
+    font-family: 'Inter', sans-serif;
+    font-size: 24px;
+    font-weight: 500;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--odyo-blue-deep);
+  }
+  .slide-header .crumb {
+    color: var(--ink-mute) !important;
+    font-size: 24px !important;
+    letter-spacing: 0.22em !important;
+    font-weight: 500 !important;
+  }
+
+  /* Bullet — square, professional */
+  ul.clean li::before {
+    background: var(--odyo-blue-deep) !important;
+    border-radius: 0 !important;
+    width: 6px !important; height: 6px !important;
+    top: 18px !important;
+  }
+
+  /* Footer */
+  footer.page-foot {
+    font-size: 24px !important;
+    letter-spacing: 0.22em !important;
+    color: var(--ink-mute) !important;
+  }
+  footer.page-foot .meta-line {
+    display: flex; gap: 18px; align-items: center;
+  }
+  footer.page-foot .meta-line .dot {
+    width: 4px; height: 4px; border-radius: 50%; background: var(--ink-mute);
+  }
+
+  /* Step number — solid, flat */
+  .step-num {
+    background: var(--odyo-blue-deep) !important;
+    border-radius: 8px !important;
+    box-shadow: none !important;
+  }
+
+  /* Cover author signature — flat, professional */
+  .cover-author {
+    margin-top: 64px;
+    display: flex; align-items: center; gap: 20px;
+    padding-top: 28px;
+    border-top: 1px solid var(--line);
+    max-width: 520px;
+  }
+  .cover-author .avatar {
+    width: 56px; height: 56px;
+    border-radius: 50%;
+    background: var(--odyo-blue-deep);
+    display: flex; align-items: center; justify-content: center;
+    color: #FFFFFF;
+    font-family: 'Inter', sans-serif;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+  }
+  .cover-author .who .name {
+    font-family: 'Inter', sans-serif;
+    font-size: 26px;
+    font-weight: 600;
+    color: var(--ink);
+    line-height: 1.1;
+    letter-spacing: -0.005em;
+  }
+  .cover-author .who .role {
+    font-family: 'Inter', sans-serif;
+    font-size: 24px;
+    font-weight: 500;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--odyo-blue-deep);
+    margin-top: 6px;
+  }
+
+  /* Logo plate — keep clean white */
+  .slide-header .logo img {
+    background: #FFFFFF !important;
+    padding: 0 !important;
+  }
+  .cover-content .logo-big img {
+    background: #FFFFFF !important;
+    padding: 0 !important;
+  }
+</style>
+</head>
+<body>
+
+<deck-stage width="1920" height="1080">
+
+  <!-- ========== SLIDE 1 — COVER ========== -->
+  <section data-label="01 Title" class="cover">
+    <div class="cover-grid"></div>
+
+    <div class="cover-content">
+      <div class="logo-big">
+        <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAATUAAABtCAMAAAD3awYYAAAAM1BMVEX///9GhcVKiMfu9Ppyo9T4+/3i7PeDr9lPjMm70+pYksxkmc+cvuGryObV5PLJ3O+Qtt2BGOCVAAAMz0lEQVR4nO1dCY/rOAieyX22+f+/dps0MR82YNzparVSkJ701CQ+uMGY+fm54YYbbrjhhhtuuOGGG2644Yb/BdTd4/F4vv51dftfr+ULsG/n+d7OvzRDN25z9Vv9Bpia9VG4xue4bFvfN808TcPvME1z0y/rs/uXlmzBY+2nYxvXjqZ+/fY6umUCfJ3w+mVafDM9174Z2CIZDM3yNHh3Di/OnsnqiUbe5OX0U7qIqvqd1u/xXLvO6RwBmqdjiMEY4I3LauhHDXELveghUk+vzwIW6k1AWYD+OwxXL9YkB96yE3WZEU7UDQrnwudrfsEjsXOVqpCuF2bmePs7v7Vrjk12PlkyozxdWNvHkklNvN5kV4zymeC4zuLsBcPow42+3RyfnZttbPos+SHCUIsgp/R9lTXdgJcYxe0qatUU+r84CK2HMm+YTCn1j7MPlSrKBz3NadGRXh0iUnaWeuYg6UMnPPyzvPZqeSE+jr2gSpUXWXDZKAZA+YwQ7GW0A+ZPjcKYzNJs48sfrLvd72ripwa31YiSptmWdR1fsK7L1s/SXhIJIREd7EUDV3P8pnJT9cu1nXVLGORDbltjlI18nHbsvfM8A2Yk/deNqfcUayQQUdOzBvnkrl3bRCjbIgexHiPENZ/oto2PsUmcFFnxXhuLCKAZ20cfsVw8VsCraa9rMvgVW3DNUTKI3uyDYbbK6AIJFrYL1fV7spBBs9iEEt2m1wt3cSK0bcSuxqqBikw3tkwPiGb6gBHXUHncd/45zmL5LzXSp1JklAht6djIl+ImAURUVzggnwzpXKcxRf+Y+/VBSGRmdiqU0SciLaMXEW0yU7dhtIwqZ6SOFBipPpWGIJ8TWzPTNpyJD0QPS3i9RuHJOe8cOlx9xoFltl6IYH6QT3KefYdmYWakpp2r6hPox9bB7FqEiWvYoLdx77HDZ0KLbJp3k3EecUckOFkFy9DGNkjsPygrGpUvQbh/q5hRA6aHS4th9FfCbBj/eAwJLFdUOoFNBPc1hgcICCc10UbW0iCfjKWRB1IFDxTfTmrA9vPxGy0ckOALyMBCSdQhyXFkMVGcGMk2cw6cZejk7wSVyJIxp6C0VvivAX40+3ANTD0Jj4menuFAOzFmo0nE1CQwPMNNRuC6tR/i50S4ypUF3YE8o8gSGQBCIGS0woC+TCwIDZK6pd8F/wWUK3c6gAcUM1ITN47JN85wtAPF4nbzgKCpIqSHqvVjACI1y78LchM4tOJeFigpnQfIBtXxR04RhdDGt8kdWpomdS6WwiWgrkFSP405KJ/BnR9kXIMHQsDVxyvw4QBMQYm3Asoo0V3kmDt5FwaTRTQxbYAcThngW3P/l1CeOCcRzfjl6YpL8sCQu0oUGy3BeYYK8s64qleX1sgfoLrJ8MA15xu3gGwP6wCruc3HsTyZPXYg6fXRDSMw/glhM1KeZPQi3BCes0cbF6JqPpOLd/qy1wlIRGJzYKkjBYDhUbERNrl/02kOMAiuFlDQIEh0SKM6woOalGoRq1kHvfnkWgIgIIx2RFOmBgjJEcWKbGGDpFXiDBlgmsLkEpneKnoSe0MO0CLKUfyZyBI55e2UjV2FwY83iRCS284BHMn8yxwA39ET4kJ3VQhoScY9rZSaJDGsIpdUQ74Ml1QeqwxcXeWVMUzjDsDSTyOC6/6CCmAOuICQiNbCb/GaFfWowQSjwAFs9juwBaUnNGB1OHKIbwo0ZaV8RLQJCkSPPGoN9wqcuz+4G3IIuc/aT8KCZPERwguSawTk4nFNQYi4BqOYMQmYwId0KekFMAxYy0mIljbwgJrXN6NHDUgXRmolCN2FzSBKaeoMUkfCzrt+mHgdzImpg7tVhZMC2MHis0AVa3TaXGCVacORWqHdvDUVyX+i72tTcp7D/pjx53nCNPF5clgDve32RwOoWKNBPwprI14jVIzsRcG9NCXnShnjRp8wox9rD2uaHGhYIy+7xJfR3aXw5FBsYXNDaiQtyQlZccyQnFir2MBZrIEGLK9x0KxBaXLtDY5IY0cnuWoCma2aN9oqKFvkNb81IL+jMJraQSMOOT4l5z2TuhQS0RosjUARM5QkjMKXI5GjwPOYpKG8oBFHz+5YYISBQUSfQStU0iE5kTG1rhB7TMkXB50gErZXWlb8GoMWUREpCgrCIDWcEDCQZwlHY+LZNSwowSmQuEq+OOhExM6VC9BIZdcIfvg0TH+3alBvARAwdSiu8Zqwd5HIZFBSfQOhFixrAzq5C4GXjzZ4wSwF1iXFCghmUvDa8jCZIxOTpzEJ1HIAjRugk3LilQKJ8gfGQMtKrvLPGQAJStk+rkaUU9sg5KkxgCq3Jvl1p5M/K6nl3l2gTfNRPGWn7eO7C3LIAW+l7AqHl2vyxU4nv+tK1YgfFAmSTPH6kw+Saz9GGBo93UFZLO1b0NLiKfGp14+YFfjZjgOBpf9mQpmtJKoWRLbm6WokolpNBfiPKbuKnukGM0LKzF43sXRSreQAJXD8KLmGxkAiIIponL4NALUa1kMY/2TADf6fXzespbgeVbU5o/xzBoBxRbkGEVXFAg770odBfIFTr/3vmwctndFW3tr03MfMGHwWT9lqDXNqut2imaWswSkaqPIWmNGfaASxKMeadrbVyD/bAFwvY4X4SN8TrUiSsXdV7ICLOkl1yASotc7Wa4C18sswxB08K0OCW5BFAZUkC2DvWGnG+6y3YWLXAU5peet0/1EdcGUxr4Ee6OXfvcUKOwAJZFyHF4wgptRnPylx5AHMujIOf5FQ8AWUOsUCxxk8Lfmr1jOqrdcSuBJQC/82q1ie/lcTgGhYOr/4LTIG2VITQqvBCabnkcLFmrvQtgXVIX/If6vq+5PkGhySKGsWvS39JY9/fVZsVYd+0W7IiB/Su2VXOljYyPfxSTwFgymsRIXDxqhmbJDAeZD29pmB2bNSB2FMYRwKxb88/0BD+k8KsSxYsZCkD4xRixTOdWvs2DgmevPLpr0X5jyArBzfJPT+eAoIrYmHq6Q8E5UxuIqZ3zQHW+AQOvXkNgeQQeAi80FyDW+IKPJHvGBpnYKC5HDMdyhf0KueE1xQKEWuh3r994PkGt7e0TheLmJLQCuwSee82OWNXWA1T+z8YRkWbjSylOXxFFBOPbxYfKPCskyWCUXz7+oFLLX3ME9XWLh0Apj4mKg0oDOewmupqlA3lWtUZ3Xp49Iv5+k90M2HBdJPBSUZxjUIUi3OYgW85qibr/CSHaVp5fd89XSd8L141Ku+cFx1uywwOrWM6hNlC5ja1i8cO0dt8y5MR1ftz/QHqhtnRrAgaJW+SdQMpcFcbjP2jjASZzSjPWpr3jVou+cK8129SPB42Zv5CbzvbmVhXkNuoqopG1jDDeOyoCe5doDRegfdi2O/5/NPriEHFLiRhgydbrSoWIH3ajCsV+956VgcXjOOnqH6+h2uRhXIA86bsR8gjbVXSChflFzjjZcsLvIk196AF9EjDOMxVygzRb3qLdoIBszPadjvJdWdJck13hLJ0qoU22ajNBTDaFNkOpuAHsbtTvksR1qdUUT+eCpqf2LetXcl107AG++cqqfKnaG3IOvu4EQCIe3cfvtYM+enOItQ4Gncnogg6iZoW/zRO+oP9yU5kqdp7hfWreqJ7zpvrjOkvRB29PcyW5CxWcSOPr7kWhu3onLX8BT2a7CFjr0p8YAAQRdPzxfCfq/2rHojukimJO0N+Tqdaes17iGWkztSCw5+4O3D9KahUTMsX9SMPXN4P9tNrnJaBvaWSMV8cq1ek853+WKJwOKuKI21DtIOCrutKlvDe/VW/8IlwVsXtfxS1mIWK7R7o+e04fCclTpfck1axXuCtCVv3PltcHJapnvkvNBe2scSv62RBgzYS/VSU8R16Ruhz/MOMmdzLIQvnb5BUiO4gRGon0nD4cHnqOWQtnNEtffr3l67TZ+quq9hI7D/yjjLM9qPO7kmfkGYmft+70YudALON0z2Ic3eru7YlDQM3XfiS7N4ihUiWApWsvn8NAFpQ5NI4Qdb9fWwvmDKOIcBnMk1BmkvVm0VTv6Nm1Q2y3icPvt6KVsNs8f85wFmdzrPm1zj4Ov7W6WGTwbIWVwI809k95p397CeloKzHbWjR2afDil195qv35cEIoSdEyX+ZwnOnD2sq2YpqylxJ9di6OLOstFC/P3566YSEXbB2GiTOP4WRLaH9dQvz+KrgUpDDw/EbiagbC75WxCjjrATHktqnV/84Vlx3T3GdVmOvzYyT8MwVPsffhim+fibI+OjoCT8W9COwp+DGL7/d0d+jlD+5ajNU/Xy2fY8wX+x3S9CN+5O9jRUw/EnY8ZMAemX4P+NsxtuuOGGG2644YYbbrjhhj/DP07NYZlzC6HpAAAAAElFTkSuQmCC" alt="Odyo Clinique">
+        
+      </div>
+
+      <h1 class="cover-title">Machine Learning CORTI</h1>
+      <p class="cover-sub">Détection automatique d'anomalies sur audiogrammes professionnels par apprentissage non supervisé.</p>
+
+      <div class="cover-author">
+        <div class="avatar">EK</div>
+        <div class="who">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cover-footer">
+      <span>Présentation projet IA · Odyo Clinique</span>
+      <span>2026</span>
+    </div>
+  </section>
+
+  <!-- ========== SLIDE 2 — CONTEXT ========== -->
+  <section data-label="02 Contexte">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">01 — Contexte</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Pourquoi ce projet</div>
+      <h1 class="title">Contexte & Problématique</h1>
+      <div class="title-rule"></div>
+
+      <div class="two-col" style="margin-top: 64px;">
+        <div>
+          <ul class="clean">
+            <li>Les travailleurs exposés au bruit subissent <strong>des audiogrammes réguliers</strong>.</li>
+            <li>Des <strong>milliers de rapports</strong> sont générés chaque année dans la base MongoDB d'Odyo.</li>
+            <li>Identifier manuellement les profils atypiques est <strong>long et subjectif</strong>.</li>
+          </ul>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 28px;">
+          <div class="card tinted">
+            <div class="lede">Objectif</div>
+            <p>Détecter automatiquement les audiogrammes anormaux <strong style="color:var(--ink)">sans étiquettes manuelles</strong> — par apprentissage non supervisé.</p>
+          </div>
+          <div class="card">
+            <div class="lede" style="color: var(--accent-warm)">Hors-périmètre</div>
+            <p>Pas de base « normal / anormal » pré-étiquetée. Le modèle apprend seul ce qui est courant et signale ce qui dévie.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>02 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 3 — AUDIOGRAM ========== -->
+  <section data-label="03 Audiogramme">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">02 — Donnée d'entrée</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Le document d'entrée du pipeline</div>
+      <h1 class="title">L'audiogramme</h1>
+      <div class="title-rule"></div>
+
+      <div class="two-col" style="margin-top: 56px; grid-template-columns: 1.15fr 1fr;">
+        <!-- Audiogram chart -->
+        <div style="background: white; border: 1px solid var(--line); border-radius: 16px; padding: 36px;">
+          <svg viewBox="0 0 720 460" style="width:100%; height:auto; display:block;" font-family="Manrope">
+            <!-- chart area -->
+            <g transform="translate(80,40)">
+              <!-- Y grid -->
+              <g stroke="#EEF2F7" stroke-width="1">
+                <line x1="0" y1="0" x2="600" y2="0"/>
+                <line x1="0" y1="60" x2="600" y2="60"/>
+                <line x1="0" y1="120" x2="600" y2="120"/>
+                <line x1="0" y1="180" x2="600" y2="180"/>
+                <line x1="0" y1="240" x2="600" y2="240"/>
+                <line x1="0" y1="300" x2="600" y2="300"/>
+              </g>
+              <!-- 25dB normal threshold band -->
+              <line x1="0" y1="60" x2="600" y2="60" stroke="#6B9B6E" stroke-width="1.5" stroke-dasharray="6 4"/>
+              <text x="600" y="56" text-anchor="end" font-size="13" fill="#6B9B6E" font-weight="600">seuil normal · 25 dB</text>
+
+              <!-- X axis ticks -->
+              <g font-size="13" fill="#8593A4" text-anchor="middle">
+                <text x="0"   y="325">250</text>
+                <text x="120" y="325">500</text>
+                <text x="240" y="325">1k</text>
+                <text x="360" y="325">2k</text>
+                <text x="480" y="325">4k</text>
+                <text x="600" y="325">8k</text>
+              </g>
+              <!-- Y axis ticks -->
+              <g font-size="13" fill="#8593A4" text-anchor="end">
+                <text x="-12" y="4">0</text>
+                <text x="-12" y="64">25</text>
+                <text x="-12" y="124">50</text>
+                <text x="-12" y="184">75</text>
+                <text x="-12" y="244">100</text>
+                <text x="-12" y="304">120</text>
+              </g>
+
+              <!-- Axis lines -->
+              <line x1="0" y1="0" x2="0" y2="300" stroke="#1A2332" stroke-width="1.5"/>
+              <line x1="0" y1="300" x2="600" y2="300" stroke="#1A2332" stroke-width="1.5"/>
+
+              <!-- OD curve (right ear) — with notch at 4kHz -->
+              <polyline fill="none" stroke="#B85450" stroke-width="2.5"
+                points="0,30 120,30 240,40 360,55 480,170 600,90"/>
+              <g fill="none" stroke="#B85450" stroke-width="2.5">
+                <circle cx="0"   cy="30"  r="6"/>
+                <circle cx="120" cy="30"  r="6"/>
+                <circle cx="240" cy="40"  r="6"/>
+                <circle cx="360" cy="55"  r="6"/>
+                <circle cx="480" cy="170" r="6"/>
+                <circle cx="600" cy="90"  r="6"/>
+              </g>
+
+              <!-- OG curve (left ear) — crosses -->
+              <polyline fill="none" stroke="#2E6BA8" stroke-width="2.5"
+                points="0,28 120,32 240,36 360,42 480,60 600,78"/>
+              <g stroke="#2E6BA8" stroke-width="2.5">
+                <g transform="translate(0,28)"><line x1="-6" y1="-6" x2="6" y2="6"/><line x1="-6" y1="6" x2="6" y2="-6"/></g>
+                <g transform="translate(120,32)"><line x1="-6" y1="-6" x2="6" y2="6"/><line x1="-6" y1="6" x2="6" y2="-6"/></g>
+                <g transform="translate(240,36)"><line x1="-6" y1="-6" x2="6" y2="6"/><line x1="-6" y1="6" x2="6" y2="-6"/></g>
+                <g transform="translate(360,42)"><line x1="-6" y1="-6" x2="6" y2="6"/><line x1="-6" y1="6" x2="6" y2="-6"/></g>
+                <g transform="translate(480,60)"><line x1="-6" y1="-6" x2="6" y2="6"/><line x1="-6" y1="6" x2="6" y2="-6"/></g>
+                <g transform="translate(600,78)"><line x1="-6" y1="-6" x2="6" y2="6"/><line x1="-6" y1="6" x2="6" y2="-6"/></g>
+              </g>
+
+              <!-- Notch annotation -->
+              <g>
+                <line x1="480" y1="170" x2="410" y2="230" stroke="#B85450" stroke-width="1" stroke-dasharray="3 3"/>
+                <rect x="300" y="230" width="220" height="50" fill="#FDF1EF" stroke="#B85450" stroke-width="1" rx="6"/>
+                <text x="410" y="252" text-anchor="middle" font-size="15" font-weight="700" fill="#B85450">Encoche 4 kHz · OD</text>
+                <text x="410" y="270" text-anchor="middle" font-size="13" fill="#7A3835">traumatisme sonore</text>
+              </g>
+
+              <!-- X label -->
+              <text x="300" y="355" text-anchor="middle" font-size="14" fill="#4A5666" font-weight="600">Fréquences (Hz) · graves → aigus</text>
+              <!-- Y label -->
+              <text transform="translate(-58,150) rotate(-90)" font-size="14" fill="#4A5666" font-weight="600" text-anchor="middle">Perte (dB)</text>
+
+              <!-- Legend -->
+              <g transform="translate(0, 380)" font-size="13" fill="#1A2332">
+                <g transform="translate(0,0)">
+                  <line x1="0" y1="0" x2="22" y2="0" stroke="#2E6BA8" stroke-width="2.5"/>
+                  <g transform="translate(11,0)" stroke="#2E6BA8" stroke-width="2.5"><line x1="-5" y1="-5" x2="5" y2="5"/><line x1="-5" y1="5" x2="5" y2="-5"/></g>
+                  <text x="32" y="4">OG · oreille gauche</text>
+                </g>
+                <g transform="translate(180,0)">
+                  <line x1="0" y1="0" x2="22" y2="0" stroke="#B85450" stroke-width="2.5"/>
+                  <circle cx="11" cy="0" r="5" fill="none" stroke="#B85450" stroke-width="2.5"/>
+                  <text x="32" y="4">OD · oreille droite</text>
+                </g>
+              </g>
+            </g>
+          </svg>
+        </div>
+
+        <!-- Reading guide -->
+        <div style="display: flex; flex-direction: column; gap: 24px; justify-content: center;">
+          <div class="card">
+            <h3>Lecture du graphique</h3>
+            <ul class="clean" style="margin-top: 12px;">
+              <li><strong>Axe X</strong> — fréquences de 250 Hz (graves) à 8 kHz (aigus).</li>
+              <li><strong>Axe Y</strong> — seuil auditif en dB. <em>Plus bas = mieux.</em></li>
+              <li><strong>Au-delà de 25 dB</strong> — perte auditive détectée.</li>
+              <li><strong>Encoche à 4 kHz</strong> — signature classique du traumatisme sonore.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>03 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 4 — PIPELINE OVERVIEW ========== -->
+  <section data-label="04 Pipeline">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">03 — Architecture</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Vue d'ensemble · 4 étapes</div>
+      <h1 class="title">De la donnée brute au score d'anomalie</h1>
+      <div class="title-rule"></div>
+
+      <!-- 4-step pipeline -->
+      <div style="margin-top: 80px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; align-items: stretch;">
+
+        <div class="card" style="position: relative;">
+          <div class="step-num">1</div>
+          <h3 style="font-size: 26px;">Données JSON</h3>
+          <p style="font-size: 20px; margin-top: 8px;">Rapports MongoDB Odyo. <span class="mono" style="color:var(--ink);">1 fichier = 1 rapport.</span></p>
+        </div>
+
+        <div class="card" style="position: relative;">
+          <div class="step-num">2</div>
+          <h3 style="font-size: 26px;">Feature Engineering</h3>
+          <p style="font-size: 20px; margin-top: 8px;">Vecteur de <strong style="color:var(--ink)">15 nombres</strong> par patient — PTA, STS, asymétrie.</p>
+        </div>
+
+        <div class="card" style="position: relative;">
+          <div class="step-num">3</div>
+          <h3 style="font-size: 26px;">3 Modèles ML</h3>
+          <p style="font-size: 20px; margin-top: 8px;">Isolation Forest · Autoencoder · PCA. Apprentissage non supervisé.</p>
+        </div>
+
+        <div class="card" style="position: relative;">
+          <div class="step-num">4</div>
+          <h3 style="font-size: 26px;">Scores & Rapports</h3>
+          <p style="font-size: 20px; margin-top: 8px;">CSV de scores, figures PDF, modèles sauvegardés (.joblib / .pt).</p>
+        </div>
+      </div>
+
+      <!-- Connector arrows -->
+      <div style="margin-top: 28px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px;">
+        <div></div><div></div><div></div><div></div>
+      </div>
+
+      <!-- Outcome strip -->
+      <div style="margin-top: auto; background: var(--odyo-blue-mist); border-left: 4px solid var(--odyo-blue); padding: 28px 36px; border-radius: 0 12px 12px 0;">
+        <p class="body" style="font-size: 24px; color: var(--ink);">
+          <strong>Résultat —</strong> chaque patient reçoit un score d'anomalie ; les profils rares sont automatiquement signalés.
+        </p>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>04 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 5 — FEATURE ENGINEERING ========== -->
+  <section data-label="05 Feature Engineering">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">Étape 2</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Étape 2</div>
+      <h1 class="title">Feature Engineering</h1>
+      <h2 class="subtitle">Transformer un audiogramme en vecteur numérique de 15 dimensions.</h2>
+      <div class="title-rule"></div>
+
+      <div style="margin-top: 56px; display: grid; grid-template-columns: 1.05fr 1fr 1fr; gap: 28px; flex: 1;">
+
+        <div class="card">
+          <div class="lede">12 features</div>
+          <h3>Seuils par fréquence</h3>
+          <p style="margin-top: 8px;">Valeurs brutes en dB pour chaque oreille.</p>
+          <div style="margin-top: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px;" class="mono">
+            <span style="color:var(--odyo-blue-deep); font-size: 18px;">L_250</span>
+            <span style="color:var(--accent-alert); font-size: 18px;">R_250</span>
+            <span style="color:var(--odyo-blue-deep); font-size: 18px;">L_500</span>
+            <span style="color:var(--accent-alert); font-size: 18px;">R_500</span>
+            <span style="color:var(--odyo-blue-deep); font-size: 18px;">L_1k</span>
+            <span style="color:var(--accent-alert); font-size: 18px;">R_1k</span>
+            <span style="color:var(--odyo-blue-deep); font-size: 18px;">L_2k</span>
+            <span style="color:var(--accent-alert); font-size: 18px;">R_2k</span>
+            <span style="color:var(--odyo-blue-deep); font-size: 18px;">L_4k</span>
+            <span style="color:var(--accent-alert); font-size: 18px;">R_4k</span>
+            <span style="color:var(--odyo-blue-deep); font-size: 18px;">L_8k</span>
+            <span style="color:var(--accent-alert); font-size: 18px;">R_8k</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="lede">3 features</div>
+          <h3>Indicateurs cliniques</h3>
+          <ul class="clean" style="margin-top: 16px;">
+            <li><strong class="mono">PTA_L / PTA_R</strong> — perte globale.</li>
+            <li><strong class="mono">high_freq_drop</strong> — chute dans les aigus.</li>
+            <li><strong class="mono">asymmetry</strong> — différence OG / OD.</li>
+          </ul>
+        </div>
+
+        <div class="card tinted">
+          <div class="lede">Préprocessing</div>
+          <h3>Avant les modèles</h3>
+          <ul class="clean" style="margin-top: 16px;">
+            <li><strong>Imputation</strong> — NaN remplacés par la médiane de la colonne.</li>
+            <li><strong>Standardisation</strong> — z-score : moyenne = 0, écart-type = 1.</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Output line -->
+      <div style="margin-top: 32px; padding: 22px 32px; background: var(--ink); color: white; border-radius: 12px; display: flex; justify-content: space-between; align-items: center;">
+        <span style="font-size: 22px; font-weight: 500; opacity: 0.7; letter-spacing: 0.1em; text-transform: uppercase;">Sortie</span>
+        <span class="mono" style="font-size: 26px; font-weight: 500;">X ∈ ℝ<sup>N × 15</sup> &nbsp;·&nbsp; matrice patients × features</span>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>05 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 6 — PTA & STS ========== -->
+  <section data-label="06 PTA STS">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAATUAAABtCAMAAAD3awYYAAAAM1BMVEX///9GhcVKiMfu9Ppyo9T4+/3i7PeDr9lPjMm70+pYksxkmc+cvuGryObV5PLJ3O+Qtt2BGOCVAAAMz0lEQVR4nO1dCY/rOAieyX22+f+/dps0MR82YNzparVSkJ701CQ+uMGY+fm54YYbbrjhhhtuuOGGG2644Yb/BdTd4/F4vv51dftfr+ULsG/n+d7OvzRDN25z9Vv9Bpia9VG4xue4bFvfN808TcPvME1z0y/rs/uXlmzBY+2nYxvXjqZ+/fY6umUCfJ3w+mVafDM9174Z2CIZDM3yNHh3Di/OnsnqiUbe5OX0U7qIqvqd1u/xXLvO6RwBmqdjiMEY4I3LauhHDXELveghUk+vzwIW6k1AWYD+OwxXL9YkB96yE3WZEU7UDQrnwudrfsEjsXOVqpCuF2bmePs7v7Vrjk12PlkyozxdWNvHkklNvN5kV4zymeC4zuLsBcPow42+3RyfnZttbPos+SHCUIsgp/R9lTXdgJcYxe0qatUU+r84CK2HMm+YTCn1j7MPlSrKBz3NadGRXh0iUnaWeuYg6UMnPPyzvPZqeSE+jr2gSpUXWXDZKAZA+YwQ7GW0A+ZPjcKYzNJs48sfrLvd72ripwa31YiSptmWdR1fsK7L1s/SXhIJIREd7EUDV3P8pnJT9cu1nXVLGORDbltjlI18nHbsvfM8A2Yk/deNqfcUayQQUdOzBvnkrl3bRCjbIgexHiPENZ/oto2PsUmcFFnxXhuLCKAZ20cfsVw8VsCraa9rMvgVW3DNUTKI3uyDYbbK6AIJFrYL1fV7spBBs9iEEt2m1wt3cSK0bcSuxqqBikw3tkwPiGb6gBHXUHncd/45zmL5LzXSp1JklAht6djIl+ImAURUVzggnwzpXKcxRf+Y+/VBSGRmdiqU0SciLaMXEW0yU7dhtIwqZ6SOFBipPpWGIJ8TWzPTNpyJD0QPS3i9RuHJOe8cOlx9xoFltl6IYH6QT3KefYdmYWakpp2r6hPox9bB7FqEiWvYoLdx77HDZ0KLbJp3k3EecUckOFkFy9DGNkjsPygrGpUvQbh/q5hRA6aHS4th9FfCbBj/eAwJLFdUOoFNBPc1hgcICCc10UbW0iCfjKWRB1IFDxTfTmrA9vPxGy0ckOALyMBCSdQhyXFkMVGcGMk2cw6cZejk7wSVyJIxp6C0VvivAX40+3ANTD0Jj4menuFAOzFmo0nE1CQwPMNNRuC6tR/i50S4ypUF3YE8o8gSGQBCIGS0woC+TCwIDZK6pd8F/wWUK3c6gAcUM1ITN47JN85wtAPF4nbzgKCpIqSHqvVjACI1y78LchM4tOJeFigpnQfIBtXxR04RhdDGt8kdWpomdS6WwiWgrkFSP405KJ/BnR9kXIMHQsDVxyvw4QBMQYm3Asoo0V3kmDt5FwaTRTQxbYAcThngW3P/l1CeOCcRzfjl6YpL8sCQu0oUGy3BeYYK8s64qleX1sgfoLrJ8MA15xu3gGwP6wCruc3HsTyZPXYg6fXRDSMw/glhM1KeZPQi3BCes0cbF6JqPpOLd/qy1wlIRGJzYKkjBYDhUbERNrl/02kOMAiuFlDQIEh0SKM6woOalGoRq1kHvfnkWgIgIIx2RFOmBgjJEcWKbGGDpFXiDBlgmsLkEpneKnoSe0MO0CLKUfyZyBI55e2UjV2FwY83iRCS284BHMn8yxwA39ET4kJ3VQhoScY9rZSaJDGsIpdUQ74Ml1QeqwxcXeWVMUzjDsDSTyOC6/6CCmAOuICQiNbCb/GaFfWowQSjwAFs9juwBaUnNGB1OHKIbwo0ZaV8RLQJCkSPPGoN9wqcuz+4G3IIuc/aT8KCZPERwguSawTk4nFNQYi4BqOYMQmYwId0KekFMAxYy0mIljbwgJrXN6NHDUgXRmolCN2FzSBKaeoMUkfCzrt+mHgdzImpg7tVhZMC2MHis0AVa3TaXGCVacORWqHdvDUVyX+i72tTcp7D/pjx53nCNPF5clgDve32RwOoWKNBPwprI14jVIzsRcG9NCXnShnjRp8wox9rD2uaHGhYIy+7xJfR3aXw5FBsYXNDaiQtyQlZccyQnFir2MBZrIEGLK9x0KxBaXLtDY5IY0cnuWoCma2aN9oqKFvkNb81IL+jMJraQSMOOT4l5z2TuhQS0RosjUARM5QkjMKXI5GjwPOYpKG8oBFHz+5YYISBQUSfQStU0iE5kTG1rhB7TMkXB50gErZXWlb8GoMWUREpCgrCIDWcEDCQZwlHY+LZNSwowSmQuEq+OOhExM6VC9BIZdcIfvg0TH+3alBvARAwdSiu8Zqwd5HIZFBSfQOhFixrAzq5C4GXjzZ4wSwF1iXFCghmUvDa8jCZIxOTpzEJ1HIAjRugk3LilQKJ8gfGQMtKrvLPGQAJStk+rkaUU9sg5KkxgCq3Jvl1p5M/K6nl3l2gTfNRPGWn7eO7C3LIAW+l7AqHl2vyxU4nv+tK1YgfFAmSTPH6kw+Saz9GGBo93UFZLO1b0NLiKfGp14+YFfjZjgOBpf9mQpmtJKoWRLbm6WokolpNBfiPKbuKnukGM0LKzF43sXRSreQAJXD8KLmGxkAiIIponL4NALUa1kMY/2TADf6fXzespbgeVbU5o/xzBoBxRbkGEVXFAg770odBfIFTr/3vmwctndFW3tr03MfMGHwWT9lqDXNqut2imaWswSkaqPIWmNGfaASxKMeadrbVyD/bAFwvY4X4SN8TrUiSsXdV7ICLOkl1yASotc7Wa4C18sswxB08K0OCW5BFAZUkC2DvWGnG+6y3YWLXAU5peet0/1EdcGUxr4Ee6OXfvcUKOwAJZFyHF4wgptRnPylx5AHMujIOf5FQ8AWUOsUCxxk8Lfmr1jOqrdcSuBJQC/82q1ie/lcTgGhYOr/4LTIG2VITQqvBCabnkcLFmrvQtgXVIX/If6vq+5PkGhySKGsWvS39JY9/fVZsVYd+0W7IiB/Su2VXOljYyPfxSTwFgymsRIXDxqhmbJDAeZD29pmB2bNSB2FMYRwKxb88/0BD+k8KsSxYsZCkD4xRixTOdWvs2DgmevPLpr0X5jyArBzfJPT+eAoIrYmHq6Q8E5UxuIqZ3zQHW+AQOvXkNgeQQeAi80FyDW+IKPJHvGBpnYKC5HDMdyhf0KueE1xQKEWuh3r994PkGt7e0TheLmJLQCuwSee82OWNXWA1T+z8YRkWbjSylOXxFFBOPbxYfKPCskyWCUXz7+oFLLX3ME9XWLh0Apj4mKg0oDOewmupqlA3lWtUZ3Xp49Iv5+k90M2HBdJPBSUZxjUIUi3OYgW85qibr/CSHaVp5fd89XSd8L141Ku+cFx1uywwOrWM6hNlC5ja1i8cO0dt8y5MR1ftz/QHqhtnRrAgaJW+SdQMpcFcbjP2jjASZzSjPWpr3jVou+cK8129SPB42Zv5CbzvbmVhXkNuoqopG1jDDeOyoCe5doDRegfdi2O/5/NPriEHFLiRhgydbrSoWIH3ajCsV+956VgcXjOOnqH6+h2uRhXIA86bsR8gjbVXSChflFzjjZcsLvIk196AF9EjDOMxVygzRb3qLdoIBszPadjvJdWdJck13hLJ0qoU22ajNBTDaFNkOpuAHsbtTvksR1qdUUT+eCpqf2LetXcl107AG++cqqfKnaG3IOvu4EQCIe3cfvtYM+enOItQ4Gncnogg6iZoW/zRO+oP9yU5kqdp7hfWreqJ7zpvrjOkvRB29PcyW5CxWcSOPr7kWhu3onLX8BT2a7CFjr0p8YAAQRdPzxfCfq/2rHojukimJO0N+Tqdaes17iGWkztSCw5+4O3D9KahUTMsX9SMPXN4P9tNrnJaBvaWSMV8cq1ek853+WKJwOKuKI21DtIOCrutKlvDe/VW/8IlwVsXtfxS1mIWK7R7o+e04fCclTpfck1axXuCtCVv3PltcHJapnvkvNBe2scSv62RBgzYS/VSU8R16Ruhz/MOMmdzLIQvnb5BUiO4gRGon0nD4cHnqOWQtnNEtffr3l67TZ+quq9hI7D/yjjLM9qPO7kmfkGYmft+70YudALON0z2Ic3eru7YlDQM3XfiS7N4ihUiWApWsvn8NAFpQ5NI4Qdb9fWwvmDKOIcBnMk1BmkvVm0VTv6Nm1Q2y3icPvt6KVsNs8f85wFmdzrPm1zj4Ov7W6WGTwbIWVwI809k95p397CeloKzHbWjR2afDil195qv35cEIoSdEyX+ZwnOnD2sq2YpqylxJ9di6OLOstFC/P3566YSEXbB2GiTOP4WRLaH9dQvz+KrgUpDDw/EbiagbC75WxCjjrATHktqnV/84Vlx3T3GdVmOvzYyT8MwVPsffhim+fibI+OjoCT8W9COwp+DGL7/d0d+jlD+5ajNU/Xy2fY8wX+x3S9CN+5O9jRUw/EnY8ZMAemX4P+NsxtuuOGGG2644YYbbrjhhj/DP07NYZlzC6HpAAAAAElFTkSuQmCC" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">Indicateurs cliniques</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Les deux indicateurs clés</div>
+      <h1 class="title">PTA &amp; STS</h1>
+      <h2 class="subtitle">Mesurer la perte globale et détecter la dégradation.</h2>
+      <div class="title-rule"></div>
+
+      <div class="two-col" style="margin-top: 56px;">
+
+        <!-- PTA -->
+        <div class="card">
+          <div class="lede">PTA · Pure Tone Average</div>
+          <h3 style="font-size: 26px;">Moyenne des seuils sur la plage de la parole</h3>
+          <p style="font-size: 20px; margin-top: 8px;" class="mono">500 Hz · 1 kHz · 2 kHz · 4 kHz</p>
+
+          <!-- Severity scale -->
+          <div style="margin-top: 32px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;">
+            <div style="padding: 16px 12px; background: #E9F4EA; border-radius: 8px; text-align: center;">
+              <div style="font-size: 16px; font-weight: 700; color: #4F7C53; letter-spacing: 0.05em;">&lt; 25 dB</div>
+              <div style="font-size: 14px; color: #4F7C53; margin-top: 4px;">Normale</div>
+            </div>
+            <div style="padding: 16px 12px; background: #FBF4E6; border-radius: 8px; text-align: center;">
+              <div style="font-size: 16px; font-weight: 700; color: #9C7A2E; letter-spacing: 0.05em;">25 – 40</div>
+              <div style="font-size: 14px; color: #9C7A2E; margin-top: 4px;">Légère</div>
+            </div>
+            <div style="padding: 16px 12px; background: #F8E8DD; border-radius: 8px; text-align: center;">
+              <div style="font-size: 16px; font-weight: 700; color: #9E5527; letter-spacing: 0.05em;">40 – 70</div>
+              <div style="font-size: 14px; color: #9E5527; margin-top: 4px;">Moyenne</div>
+            </div>
+            <div style="padding: 16px 12px; background: #F4DAD8; border-radius: 8px; text-align: center;">
+              <div style="font-size: 16px; font-weight: 700; color: #8C3A37; letter-spacing: 0.05em;">&gt; 70 dB</div>
+              <div style="font-size: 14px; color: #8C3A37; margin-top: 4px;">Sévère</div>
+            </div>
+          </div>
+
+          <p style="font-size: 18px; margin-top: 24px; color: var(--ink-soft);">
+            PTA élevé = perte importante dans la plage de la parole. Calculé séparément pour OG et OD.
+          </p>
+        </div>
+
+        <!-- STS -->
+        <div class="card tinted">
+          <div class="lede">STS · Standard Threshold Shift</div>
+          <h3 style="font-size: 26px;">Dégradation par rapport au baseline</h3>
+          <p style="font-size: 18px; margin-top: 4px; color: var(--ink-mute);">Critère réglementaire OSHA.</p>
+
+          <!-- Formula -->
+          <div style="margin-top: 28px; padding: 24px; background: white; border-radius: 10px; border: 1px solid var(--line);">
+            <div class="mono" style="font-size: 18px; color: var(--ink-soft); line-height: 1.7;">
+              <span style="color:var(--odyo-blue-deep); font-weight: 600;">STS</span> = moy(2k, 3k, 4k)<sub>actuel</sub><br>
+              &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;− moy(2k, 3k, 4k)<sub>baseline</sub>
+            </div>
+          </div>
+
+          <!-- Alert -->
+          <div style="margin-top: 24px; padding: 18px 22px; background: white; border-left: 4px solid var(--accent-alert); border-radius: 0 8px 8px 0;">
+            <div style="font-size: 22px; font-weight: 700; color: var(--accent-alert);">STS ≥ 10 dB</div>
+            <p style="font-size: 18px; margin: 6px 0 0 0; color: var(--ink-soft);">Alerte de dégradation professionnelle — l'employeur doit prendre des mesures (EPI, révision de poste).</p>
+          </div>
+
+          <p style="font-size: 17px; margin-top: 18px; color: var(--ink-mute);">
+            Calculé en mode delta uniquement · flag binaire <span class="mono">has_sts = 1</span> si STS ≥ 10 dB.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>06 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 7 — 3 MODELS ========== -->
+  <section data-label="07 Modeles">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">Étape 3</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Étape 3 · trois approches complémentaires</div>
+      <h1 class="title">Les 3 Modèles de Détection</h1>
+      <div class="title-rule"></div>
+
+      <div class="three-col" style="margin-top: 56px;">
+
+        <div class="card">
+          <div class="lede">Modèle 1</div>
+          <h3>Isolation Forest</h3>
+          <p style="font-size: 20px; margin-top: 14px;">200 arbres de décision aléatoires. On mesure combien de coupures sont nécessaires pour isoler chaque patient.</p>
+
+          <div style="margin-top: 22px; padding: 16px; background: var(--paper-tint); border-radius: 8px; font-size: 17px; color: var(--ink-soft); line-height: 1.5;">
+            ↳ Peu de coupures = profil rare<br>
+            ↳ Beaucoup = profil courant
+          </div>
+
+          <div style="margin-top: auto; padding-top: 24px;">
+            <div style="font-size: 14px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-mute); font-weight: 600;">Score</div>
+            <div style="font-size: 18px; color: var(--ink); margin-top: 6px;">Plus négatif = plus anormal.</div>
+          </div>
+        </div>
+
+        <div class="card" style="background: var(--odyo-blue-deep); color: white; border-color: var(--odyo-blue-deep);">
+          <div class="lede" style="color: rgba(255,255,255,0.7)">Modèle 2</div>
+          <h3 style="color: white;">Autoencoder</h3>
+          <p style="font-size: 20px; margin-top: 14px; color: rgba(255,255,255,0.85);">Réseau de neurones qui apprend à <strong style="color:white;">comprimer puis reconstruire</strong> les audiogrammes.</p>
+
+          <div style="margin-top: 22px; padding: 16px; background: rgba(255,255,255,0.1); border-radius: 8px; font-size: 17px; color: rgba(255,255,255,0.85); line-height: 1.5;">
+            ↳ Profil fréquent → bien reconstitué<br>
+            ↳ Profil rare → mal reconstitué
+          </div>
+
+          <div style="margin-top: auto; padding-top: 24px;">
+            <div style="font-size: 14px; letter-spacing: 0.16em; text-transform: uppercase; color: rgba(255,255,255,0.6); font-weight: 600;">Score</div>
+            <div style="font-size: 18px; margin-top: 6px;">Erreur MSE — grande erreur = suspect.</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="lede">Modèle 3 · référence</div>
+          <h3>PCA</h3>
+          <p style="font-size: 20px; margin-top: 14px;">Résume les 15 features en <strong>5 axes principaux</strong>, puis reconstruit à partir de ces axes.</p>
+
+          <div style="margin-top: 22px; padding: 16px; background: var(--paper-tint); border-radius: 8px; font-size: 17px; color: var(--ink-soft); line-height: 1.5;">
+            ↳ Profil atypique = ne rentre pas bien dans 5 axes
+          </div>
+
+          <div style="margin-top: auto; padding-top: 24px;">
+            <div style="font-size: 14px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-mute); font-weight: 600;">Rôle</div>
+            <div style="font-size: 18px; color: var(--ink); margin-top: 6px;">Baseline — valider que les autres font mieux.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>07 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 8 — CONSENSUS ========== -->
+  <section data-label="08 Consensus">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">Décision finale</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Consensus · règle 2 sur 3</div>
+      <h1 class="title">La décision finale</h1>
+      <h2 class="subtitle">Un patient est signalé anormal lorsque <strong style="color:var(--odyo-blue-deep)">deux modèles sur trois</strong> sont d'accord.</h2>
+      <div class="title-rule"></div>
+
+      <div class="two-col" style="margin-top: 56px; grid-template-columns: 1fr 1.1fr;">
+
+        <!-- Venn diagram -->
+        <div style="display: flex; align-items: center; justify-content: center; background: var(--paper-tint); border-radius: 16px; border: 1px solid var(--line); padding: 32px;">
+          <svg viewBox="0 0 480 460" style="width: 100%; max-width: 480px; height: auto;" font-family="Manrope">
+            <!-- Three circles -->
+            <circle cx="180" cy="180" r="130" fill="rgba(74,134,197,0.18)" stroke="#4A86C5" stroke-width="2"/>
+            <circle cx="300" cy="180" r="130" fill="rgba(46,107,168,0.22)" stroke="#2E6BA8" stroke-width="2"/>
+            <circle cx="240" cy="290" r="130" fill="rgba(184,84,80,0.18)" stroke="#B85450" stroke-width="2"/>
+
+            <!-- Labels -->
+            <text x="100" y="100" font-size="18" font-weight="700" fill="#2E6BA8" text-anchor="middle">Isolation</text>
+            <text x="100" y="122" font-size="18" font-weight="700" fill="#2E6BA8" text-anchor="middle">Forest</text>
+
+            <text x="380" y="100" font-size="18" font-weight="700" fill="#2E6BA8" text-anchor="middle">Auto-</text>
+            <text x="380" y="122" font-size="18" font-weight="700" fill="#2E6BA8" text-anchor="middle">encoder</text>
+
+            <text x="240" y="430" font-size="18" font-weight="700" fill="#B85450" text-anchor="middle">PCA</text>
+
+            <!-- Center -->
+            <circle cx="240" cy="220" r="44" fill="#1A2332"/>
+            <text x="240" y="218" font-size="22" font-weight="800" fill="white" text-anchor="middle">2/3</text>
+            <text x="240" y="240" font-size="11" font-weight="600" fill="rgba(255,255,255,0.7)" text-anchor="middle" letter-spacing="1">CONSENSUS</text>
+          </svg>
+        </div>
+
+        <!-- Right column -->
+        <div style="display: flex; flex-direction: column; gap: 22px; justify-content: center;">
+
+          <div class="card tinted">
+            <div class="mono" style="font-size: 20px; color: var(--odyo-blue-deep); font-weight: 600;">anomaly_consensus = 1</div>
+            <p style="font-size: 22px; margin-top: 10px;">Patient signalé anormal et remonté pour revue.</p>
+          </div>
+
+          <ul class="clean">
+            <li>Chaque méthode a ses <strong>angles morts</strong> ; le consensus réduit les fausses alarmes.</li>
+            <li>Un seul modèle peut se tromper — <strong>deux en accord</strong> est bien plus fiable.</li>
+            <li>Seuil par défaut : <strong>~5 %</strong> des patients signalés. <span class="mono" style="font-size: 22px;">contamination = 0.05</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>08 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 9 — RESULTS ========== -->
+  <section data-label="09 Resultats">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">Étape 4</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Étape 4 · ce que produit le pipeline</div>
+      <h1 class="title">Résultats &amp; Sorties</h1>
+      <div class="title-rule"></div>
+
+      <div class="three-col" style="margin-top: 56px;">
+
+        <div class="card">
+          <div class="mono" style="font-size: 18px; color: var(--odyo-blue-deep); font-weight: 600; margin-bottom: 14px;">scores.csv</div>
+          <h3>Tableau de scores</h3>
+          <ul class="clean" style="margin-top: 18px;">
+            <li>Score Isolation Forest</li>
+            <li>Erreur Autoencoder</li>
+            <li>Erreur PCA</li>
+            <li>Flag consensus (0 / 1)</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="mono" style="font-size: 18px; color: var(--odyo-blue-deep); font-weight: 600; margin-bottom: 14px;">.joblib · .pt</div>
+          <h3>Modèles sauvegardés</h3>
+          <p style="font-size: 20px; margin-top: 14px;">Réutilisables sur de nouveaux patients sans ré-entraîner&nbsp;:</p>
+          <ul class="clean" style="margin-top: 18px;">
+            <li class="mono" style="font-size: 20px;">isolation_forest.joblib</li>
+            <li class="mono" style="font-size: 20px;">autoencoder.pt</li>
+            <li class="mono" style="font-size: 20px;">scaler.joblib</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="mono" style="font-size: 18px; color: var(--odyo-blue-deep); font-weight: 600; margin-bottom: 14px;">figures · pdf</div>
+          <h3>4 visualisations</h3>
+          <ul class="clean" style="margin-top: 18px;">
+            <li>Distribution des scores</li>
+            <li>Top 6 audiogrammes les plus anormaux</li>
+            <li>Cartes UMAP 2D</li>
+            <li>Visualisation des clusters</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Run command -->
+      <div style="margin-top: 32px; background: var(--ink); border-radius: 12px; padding: 24px 32px; display: flex; align-items: center; gap: 24px;">
+        <span style="font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase; color: rgba(255,255,255,0.5); font-weight: 600;">Commande</span>
+        <span class="mono" style="font-size: 22px; color: white;">$ python main.py --data "JSON reports/" --mode abs</span>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>09 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 10 — UMAP ========== -->
+  <section data-label="10 UMAP">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">Visualisation</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Cartographie des profils</div>
+      <h1 class="title">UMAP — Visualiser en 2D</h1>
+      <h2 class="subtitle">Projeter 15 dimensions sur une carte lisible.</h2>
+      <div class="title-rule"></div>
+
+      <div class="two-col" style="margin-top: 56px; grid-template-columns: 1fr 1.15fr;">
+
+        <div style="display: flex; flex-direction: column; gap: 22px; justify-content: center;">
+          <ul class="clean">
+            <li>Chaque patient = <strong>1 point</strong> dans un espace à 15 dimensions.</li>
+            <li>UMAP <strong>aplatit</strong> cet espace en 2D en conservant les distances.</li>
+            <li><strong>2 points proches</strong> sur la carte — profils auditifs similaires.</li>
+            <li><strong>1 point isolé</strong> — profil radicalement différent des autres.</li>
+          </ul>
+
+          <div style="display: flex; gap: 28px; margin-top: 12px; padding: 20px 24px; background: var(--paper-tint); border-radius: 12px; border: 1px solid var(--line);">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="width: 14px; height: 14px; border-radius: 50%; background: #4A86C5; display: inline-block;"></span>
+              <span style="font-size: 18px; color: var(--ink-soft);">patient normal · profil courant</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="width: 14px; height: 14px; border-radius: 50%; background: #B85450; display: inline-block;"></span>
+              <span style="font-size: 18px; color: var(--ink-soft);">patient anormal · profil rare</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- UMAP map -->
+        <div style="background: white; border: 1px solid var(--line); border-radius: 16px; padding: 24px; display: flex; flex-direction: column; min-height: 0;">
+          <div style="font-size: 16px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-mute); font-weight: 600; margin-bottom: 12px;">Carte UMAP · simulée</div>
+          <svg viewBox="0 0 600 480" preserveAspectRatio="xMidYMid meet" style="width: 100%; height: 100%; max-height: 620px; display: block; flex: 1; min-height: 0;" font-family="Manrope">
+            <!-- Subtle grid -->
+            <rect x="0" y="0" width="600" height="480" fill="#FAFBFD" rx="8"/>
+            <g stroke="#EEF2F7" stroke-width="1">
+              <line x1="0" y1="120" x2="600" y2="120"/>
+              <line x1="0" y1="240" x2="600" y2="240"/>
+              <line x1="0" y1="360" x2="600" y2="360"/>
+              <line x1="150" y1="0" x2="150" y2="480"/>
+              <line x1="300" y1="0" x2="300" y2="480"/>
+              <line x1="450" y1="0" x2="450" y2="480"/>
+            </g>
+
+            <!-- Cluster 1 (big blue blob, center-left) -->
+            <g fill="#4A86C5" opacity="0.85">
+              <circle cx="180" cy="220" r="6"/>
+              <circle cx="200" cy="200" r="6"/>
+              <circle cx="160" cy="240" r="6"/>
+              <circle cx="220" cy="230" r="6"/>
+              <circle cx="190" cy="260" r="6"/>
+              <circle cx="240" cy="210" r="6"/>
+              <circle cx="170" cy="200" r="6"/>
+              <circle cx="210" cy="180" r="6"/>
+              <circle cx="230" cy="250" r="6"/>
+              <circle cx="150" cy="220" r="6"/>
+              <circle cx="200" cy="240" r="6"/>
+              <circle cx="180" cy="260" r="6"/>
+              <circle cx="220" cy="190" r="6"/>
+              <circle cx="160" cy="180" r="6"/>
+              <circle cx="240" cy="240" r="6"/>
+            </g>
+
+            <!-- Cluster 2 (smaller blue, upper right) -->
+            <g fill="#4A86C5" opacity="0.85">
+              <circle cx="380" cy="140" r="6"/>
+              <circle cx="400" cy="120" r="6"/>
+              <circle cx="420" cy="150" r="6"/>
+              <circle cx="390" cy="170" r="6"/>
+              <circle cx="370" cy="120" r="6"/>
+              <circle cx="410" cy="180" r="6"/>
+              <circle cx="430" cy="130" r="6"/>
+              <circle cx="360" cy="160" r="6"/>
+            </g>
+
+            <!-- Cluster 3 (lower right) -->
+            <g fill="#4A86C5" opacity="0.85">
+              <circle cx="460" cy="320" r="6"/>
+              <circle cx="480" cy="340" r="6"/>
+              <circle cx="450" cy="350" r="6"/>
+              <circle cx="470" cy="300" r="6"/>
+              <circle cx="490" cy="320" r="6"/>
+              <circle cx="440" cy="330" r="6"/>
+            </g>
+
+            <!-- Anomalies -->
+            <g fill="#B85450">
+              <circle cx="60" cy="80" r="8"/>
+              <circle cx="540" cy="420" r="8"/>
+              <circle cx="100" cy="400" r="8"/>
+            </g>
+
+            <!-- Highlight ring on one anomaly -->
+            <circle cx="540" cy="420" r="22" fill="none" stroke="#B85450" stroke-width="1.5" stroke-dasharray="4 4"/>
+            <line x1="540" y1="420" x2="500" y2="430" stroke="#B85450" stroke-width="1" stroke-dasharray="3 3"/>
+            <rect x="320" y="410" width="180" height="40" fill="white" stroke="#B85450" stroke-width="1" rx="6"/>
+            <text x="410" y="427" text-anchor="middle" font-size="13" font-weight="700" fill="#B85450">Patient anormal</text>
+            <text x="410" y="442" text-anchor="middle" font-size="12" fill="#7A3835">score élevé</text>
+
+            <!-- Axes labels -->
+            <text x="20" y="24" font-size="12" fill="#8593A4" font-weight="600">UMAP-2</text>
+            <text x="555" y="468" font-size="12" fill="#8593A4" font-weight="600" text-anchor="end">UMAP-1 →</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>10 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 11 — STRENGTHS & PERSPECTIVES ========== -->
+  <section data-label="11 Perspectives">
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">Bilan</div>
+      </div>
+    </div>
+
+    <div class="slide-body">
+      <div class="eyebrow">Apports, limites, suite</div>
+      <h1 class="title">Points Forts &amp; Perspectives</h1>
+      <div class="title-rule"></div>
+
+      <div class="three-col" style="margin-top: 56px;">
+
+        <div class="card" style="border-top: 4px solid var(--accent-ok);">
+          <div style="font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent-ok); font-weight: 700; margin-bottom: 14px;">Points forts</div>
+          <ul class="clean">
+            <li><strong>Aucun label</strong> manuel requis.</li>
+            <li><strong>Consensus 3 méthodes</strong> — moins de fausses alarmes.</li>
+            <li><strong>Deux modes</strong> — absolu (profil global) ou delta (vs baseline).</li>
+            <li><strong>Modèles sauvegardés</strong> — scoring sans ré-entraîner.</li>
+          </ul>
+        </div>
+
+        <div class="card" style="border-top: 4px solid var(--accent-warm);">
+          <div style="font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent-warm); font-weight: 700; margin-bottom: 14px;">Limites actuelles</div>
+          <ul class="clean">
+            <li><strong>11 patients</strong> dans les données test — à valider sur cohorte plus large.</li>
+            <li>Pas de <strong>vérité terrain</strong> — précision exacte non mesurable.</li>
+            <li>Seuil de 5 % à <strong>calibrer avec un clinicien</strong>.</li>
+          </ul>
+        </div>
+
+        <div class="card" style="border-top: 4px solid var(--odyo-blue);">
+          <div style="font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--odyo-blue-deep); font-weight: 700; margin-bottom: 14px;">Perspectives</div>
+          <ul class="clean">
+            <li>Intégration de <strong>cas étiquetés</strong> par des audiologistes pour valider et affiner.</li>
+            <li><strong>Déploiement API</strong> — scorer en temps réel les nouveaux bilans entrants.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <footer class="page-foot"><span class="meta-line"><span>AI Corti</span><span class="dot"></span><span>Enzo Kara · Ingénieur IA</span></span><span>11 / 12</span></footer>
+  </section>
+
+  <!-- ========== SLIDE 12 — THANKS ========== -->
+  <section data-label="12 Merci" class="cover">
+    <div class="cover-grid"></div>
+
+    <div class="slide-header">
+      <div class="logo">
+        <img src="data:image/png;base64,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" alt="">
+        <div class="meta"><div class="sub">AI Corti · 2026</div></div>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:8px;">
+        <div class="author-chip">
+          <div class="name">Enzo Kara</div>
+          <div class="role">Ingénieur IA</div>
+        </div>
+        <div class="crumb">Fin</div>
+      </div>
+    </div>
+
+    <div style="position: absolute; left: 100px; right: 100px; top: 50%; transform: translateY(-50%);">
+      <h1 class="cover-title" style="font-size: 132px;">Merci</h1>
+      <p class="cover-sub" style="font-size: 36px;">pour votre attention.</p>
+      <div style="margin-top: 56px; font-size: 26px; color: var(--ink-soft); letter-spacing: 0.05em;">Questions&nbsp;?</div>
+
+      <!-- Recap strip -->
+      <div style="margin-top: 80px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px;">
+        <div style="padding: 20px 24px; background: white; border: 1px solid var(--line); border-radius: 12px;">
+          <div style="font-size: 14px; letter-spacing: 0.16em; color: var(--odyo-blue-deep); font-weight: 700;">01</div>
+          <div style="font-size: 19px; color: var(--ink); margin-top: 6px; font-weight: 600;">Données JSON</div>
+        </div>
+        <div style="padding: 20px 24px; background: white; border: 1px solid var(--line); border-radius: 12px;">
+          <div style="font-size: 14px; letter-spacing: 0.16em; color: var(--odyo-blue-deep); font-weight: 700;">02</div>
+          <div style="font-size: 19px; color: var(--ink); margin-top: 6px; font-weight: 600;">Feature Engineering</div>
+          <div style="font-size: 15px; color: var(--ink-mute); margin-top: 4px;">PTA, STS…</div>
+        </div>
+        <div style="padding: 20px 24px; background: white; border: 1px solid var(--line); border-radius: 12px;">
+          <div style="font-size: 14px; letter-spacing: 0.16em; color: var(--odyo-blue-deep); font-weight: 700;">03</div>
+          <div style="font-size: 19px; color: var(--ink); margin-top: 6px; font-weight: 600;">3 Modèles ML</div>
+          <div style="font-size: 15px; color: var(--ink-mute); margin-top: 4px;">IF · AE · PCA</div>
+        </div>
+        <div style="padding: 20px 24px; background: white; border: 1px solid var(--line); border-radius: 12px;">
+          <div style="font-size: 14px; letter-spacing: 0.16em; color: var(--odyo-blue-deep); font-weight: 700;">04</div>
+          <div style="font-size: 19px; color: var(--ink); margin-top: 6px; font-weight: 600;">Score d'anomalie</div>
+          <div style="font-size: 15px; color: var(--ink-mute); margin-top: 4px;">consensus 2/3</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cover-footer">
+      <span>AI Corti — Odyo Clinique</span>
+      <span>12 / 12</span>
+    </div>
+  </section>
+
+</deck-stage>
+
+</body>
+</html>

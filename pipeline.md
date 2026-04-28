@@ -40,7 +40,7 @@ L'objectif est de détecter automatiquement les **audiogrammes atypiques** sans 
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │              ÉTAPE 2 — FEATURE ENGINEERING (src/features.py)       │
-│   • Interpole les seuils aux 6 fréquences standard                  │
+│   • Interpole les seuils aux 6 fréquences standard  (250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz)                │
 │   • Calcule PTA, asymétrie, chute HF, STS...                       │
 │   • Impute les NaN (médiane) + standardise (z-score)               │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -516,3 +516,231 @@ feature_df, _ = build_feature_matrix(new_df)
 X_new, _, _   = preprocess(feature_df, scaler=scaler, imputer=imputer, fit=False)
 scores = if_model.score_samples(X_new)
 ```
+
+---
+
+## 8. Glossaire — Concepts expliqués simplement
+
+> Cette section explique tous les termes techniques du pipeline, sans prérequis en audiologie ni en machine learning.
+
+---
+
+### Audiogramme
+
+C'est le "graphique de l'audition" d'un patient. On lui fait entendre des sons purs à différentes fréquences (des graves aux aigus) et on note le volume minimal (en dB) à partir duquel il les entend.
+
+```
+Fréquence (Hz) : graves ──────────────────────────────▶ aigus
+                  250    500   1k    2k    4k    8k
+
+Volume (dB)
+     0 dB  ─────────────────────────────────────────  ← entend tout (parfait)
+    25 dB  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  ← seuil de normalité
+    50 dB  ────────────────────────────────────────
+   120 dB  ─────────────────────────────────────────  ← n'entend quasiment rien
+```
+
+Un point à 60 dB à 4000 Hz signifie : il faut un son de 60 dB (assez fort) pour que le patient entende les aigus autour de 4000 Hz. Plus le point est bas sur le graphique, plus la perte est importante.
+
+---
+
+### dB (décibel)
+
+Unité de mesure du volume sonore. En audiologie, on parle de **seuil auditif** : le volume minimum pour qu'un patient entende un son.
+
+```
+  0 dB  → chuchotement imperceptible (audition parfaite)
+ 25 dB  → seuil de normalité
+ 60 dB  → niveau d'une conversation normale
+ 80 dB  → aspirateur
+120 dB  → concert de rock / seuil de douleur
+```
+
+Un patient avec un seuil à 70 dB a besoin qu'on lui parle au niveau d'un aspirateur pour qu'il entende correctement.
+
+---
+
+### PTA — Pure Tone Average (Moyenne des Tons Purs)
+
+C'est le résumé en un seul chiffre de la perte auditive d'une personne. On fait la **moyenne des seuils à 4 fréquences** qui couvrent la plage de la parole humaine :
+
+```
+PTA = ( seuil_500Hz + seuil_1000Hz + seuil_2000Hz + seuil_4000Hz ) / 4
+```
+
+Pourquoi ces 4 fréquences ? Parce qu'elles correspondent aux sons des voyelles et consonnes du langage courant. Si on entend mal dans cette plage, on a du mal à suivre une conversation.
+
+```
+PTA < 25 dB   → Audition normale     (pas de problème)
+PTA 25–40 dB  → Perte légère         (difficultés au téléphone, dans le bruit)
+PTA 40–70 dB  → Perte moyenne        (difficultés en conversation normale)
+PTA > 70 dB   → Perte sévère/profonde (quasi aucune compréhension sans aide)
+```
+
+---
+
+### STS — Standard Threshold Shift (Décalage Standard du Seuil)
+
+C'est un **critère réglementaire** (norme OSHA aux États-Unis, repris en médecine du travail) pour détecter une dégradation auditive liée au travail.
+
+**Principe :** on compare l'audiogramme actuel d'un travailleur à son audiogramme de référence (Baseline), uniquement aux fréquences 2000 Hz, 3000 Hz et 4000 Hz — la zone la plus sensible aux traumatismes sonores professionnels.
+
+```
+STS = moyenne( seuil_actuel(2k) + seuil_actuel(3k) + seuil_actuel(4k) )
+    − moyenne( seuil_baseline(2k) + seuil_baseline(3k) + seuil_baseline(4k) )
+```
+
+**Seuil d'alerte :** si STS ≥ **10 dB**, c'est une alerte.
+
+```
+Exemple concret :
+  Baseline (2017) :  25 dB / 30 dB / 35 dB  → moyenne = 30 dB
+  Actuel   (2024) :  35 dB / 42 dB / 48 dB  → moyenne = 41.7 dB
+  
+  STS = 41.7 − 30 = 11.7 dB  → ⚠ STS positif, dégradation significative
+```
+
+En pratique : un STS ≥ 10 dB peut obligatoirement déclencher une action de l'employeur (révision du poste, port de protecteurs auditifs obligatoire...).
+
+Dans ce pipeline, on calcule le STS séparément pour l'oreille gauche (`sts_L`) et droite (`sts_R`), et on génère un flag binaire (`has_sts_L/R = 1`) quand le seuil est dépassé.
+
+---
+
+### Encoche 4 kHz (Notch audiométrique)
+
+C'est le signe radiographique du traumatisme sonore. Sur l'audiogramme, la perte est maximale autour de **4000 Hz**, puis remonte légèrement à 8000 Hz — formant une "encoche" (notch) caractéristique.
+
+```
+  Seuil (dB)
+   0
+  20  ·    ·
+  40           ·         ← aggravation à 2k-4k Hz
+  60               ·     ← pire à 4k Hz (zone lésée)
+  40                  ·  ← remonte à 8k Hz  ← encoche typique
+       250 500 1k 2k 4k 8k
+```
+
+Cause : les cellules ciliées de la cochlée (l'organe auditif interne) qui traitent les sons autour de 4000 Hz sont les plus exposées aux traumatismes sonores répétés (machines, casques, concerts...).
+
+Dans le pipeline, la feature `high_freq_drop = seuil_8kHz − seuil_4kHz` capture ce pattern : si ce chiffre est négatif (le seuil remonte entre 4k et 8k), c'est le signe d'une encoche.
+
+---
+
+### PCA — Principal Component Analysis (Analyse en Composantes Principales)
+
+**Analogie :** imaginez que vous avez 15 caractéristiques pour chaque patient (comme 15 dimensions). La PCA cherche les "axes" qui résument le mieux ces 15 dimensions en seulement 5 (ou moins).
+
+```
+Données originales (15 features)
+        │
+        ▼  PCA
+5 composantes principales
+(résumé de l'essentiel de la variance)
+        │
+        ▼  PCA inverse
+15 features reconstruites (approximation)
+        │
+        ▼
+Erreur = écart entre original et reconstruit
+```
+
+**Intuition :** si tous les patients ont des profils similaires, les 5 composantes suffisent à reconstruire leurs audiogrammes fidèlement. Un patient atypique ne sera pas bien résumé par ces 5 axes communs → son erreur de reconstruction sera élevée → il est suspect.
+
+C'est la méthode la plus simple du pipeline. Elle sert de **référence (baseline)** pour évaluer si les méthodes plus complexes (Isolation Forest, Autoencoder) font vraiment mieux.
+
+---
+
+### Isolation Forest
+
+**Analogie :** imaginez une forêt de questions aléatoires du type "ta feature X est-elle au-dessus ou en dessous de Y ?". Pour isoler un individu atypique, il faut peu de questions (il se distingue vite). Pour isoler un individu normal (qui ressemble aux autres), il en faut beaucoup.
+
+```
+Patient NORMAL   → beaucoup de questions nécessaires → difficile à isoler
+Patient ANORMAL  → peu de questions nécessaires      → facile à isoler
+
+Score :  -0.57  ← très négatif = anormal (peu de coupures nécessaires)
+         -0.43  ← proche de 0 = normal (beaucoup de coupures)
+```
+
+L'algorithme construit 200 arbres de décision aléatoires et mesure la profondeur moyenne à laquelle chaque patient est isolé.
+
+---
+
+### Autoencoder (Réseau de neurones)
+
+**Analogie :** c'est comme apprendre à résumer un livre en 6 mots, puis à le réécrire depuis ce résumé. Si le livre est "classique" (comme les autres), le résumé et la réécriture sont fidèles. Si le livre est totalement atypique, le résumé de 6 mots sera pauvre et la réécriture sera mauvaise.
+
+```
+15 features          6 valeurs (résumé)        15 features (réécriture)
+    │                       │                          │
+    └──── compression ──────┘────── décompression ─────┘
+               ENCODEUR                 DÉCODEUR
+
+Erreur = différence entre les 15 features originales et les 15 reconstruites
+```
+
+Le réseau s'entraîne sur tous les audiogrammes du dataset. Il apprend à bien reconstruire les profils fréquents. Un profil rare mal appris = erreur de reconstruction élevée = anomalie.
+
+---
+
+### UMAP — Uniform Manifold Approximation and Projection
+
+**Analogie :** imaginez que vous avez 15 caractéristiques par patient → vous êtes dans un espace à 15 dimensions, impossible à visualiser. UMAP projette ces 15 dimensions sur une carte 2D (comme aplatir un globe terrestre sur une carte plate), en essayant de **conserver les distances** : deux patients proches dans les 15 dimensions restent proches sur la carte.
+
+```
+Chaque point sur la carte = 1 patient
+Proximité sur la carte    = profils auditifs similaires
+Point isolé               = profil radicalement différent des autres
+```
+
+Dans ce pipeline, la carte est colorée par l'erreur de reconstruction de l'Autoencoder : les points rouges (erreur élevée) sont les anomalies, les verts sont les normaux.
+
+---
+
+### Z-score (Standardisation)
+
+Technique mathématique pour mettre toutes les features à la même échelle, afin qu'aucune ne "domine" les autres simplement par son ordre de grandeur.
+
+```
+nouvelle_valeur = (valeur − moyenne_de_la_colonne) / écart_type_de_la_colonne
+```
+
+Résultat : toutes les features ont une moyenne = 0 et un écart-type = 1.
+
+```
+Sans standardisation :
+  seuil_8kHz = 80 dB    ← domine mathématiquement
+  asymmetry  = 5 dB     ← ignoré car petit
+  → le modèle croit que les aigus sont 16× plus importants
+
+Avec standardisation :
+  seuil_8kHz = +1.2     ← même importance
+  asymmetry  = +0.8     ← même importance
+  → le modèle traite toutes les features équitablement
+```
+
+---
+
+### Imputation (médiane)
+
+Quand une fréquence n'a pas été mesurée pour un patient (ex: 250 Hz absent), la case est vide (`NaN`). Les modèles ML ne savent pas gérer les cases vides.
+
+On remplace chaque case vide par la **médiane** de cette colonne sur tout le dataset (la valeur "du milieu" si on trie toutes les valeurs de la colonne).
+
+On choisit la médiane plutôt que la moyenne car elle est robuste aux valeurs extrêmes : un patient avec une perte sévère à 90 dB ne va pas trop fausser la valeur d'imputation.
+
+---
+
+### Consensus (≥ 2 modèles sur 3)
+
+Pour éviter les fausses alarmes, on ne signale un patient comme anormal que si **au moins 2 des 3 méthodes** (Isolation Forest, Autoencoder, PCA) sont d'accord.
+
+```
+Isolation Forest : ANORMAL ✓
+Autoencoder      : ANORMAL ✓
+PCA              : normal  ✗
+
+→ 2/3 d'accord → consensus = ANORMAL (alerte confirmée)
+```
+
+Chaque méthode a ses angles morts : l'une peut être sensible aux valeurs extrêmes, l'autre à la forme du profil. Le consensus rend le système plus robuste qu'un seul modèle.

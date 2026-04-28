@@ -76,6 +76,7 @@ def load_data(data_path: Path) -> pd.DataFrame:
         print(f"Chargement du fichier : {data_path}")
         records = load_json_file(data_path)
         df = pd.DataFrame(records)
+        df = df.sort_values(["patient", "visit_date"]).reset_index(drop=True)
 
     print(f"  {len(df)} records valides — {df['patient'].nunique()} patients uniques")
     return df
@@ -119,7 +120,6 @@ def build_features(df: pd.DataFrame, mode: str):
 
 def save_outputs(
     output_dir: Path,
-    df_pipeline: pd.DataFrame,
     scores_df: pd.DataFrame,
     if_model,
     ae_model,
@@ -153,14 +153,13 @@ def generate_plots(
         plot_anomaly_score_distribution,
         plot_top_anomalies,
         plot_umap,
-        summary_report,
     )
 
     figures_dir = output_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     # Distribution des scores
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    _, axes = plt.subplots(1, 3, figsize=(15, 4))
     plot_anomaly_score_distribution(
         scores_df["anomaly_score_if"], title="Isolation Forest", ax=axes[0]
     )
@@ -237,7 +236,7 @@ def main() -> None:
     from src.evaluate import summary_report
     summary_report(df_pipeline, scores_df)
 
-    save_outputs(output_dir, df_pipeline, scores_df, if_model, ae_model, scaler, imputer)
+    save_outputs(output_dir, scores_df, if_model, ae_model, scaler, imputer)
 
     if not args.no_plots:
         print("\nGénération des figures...")

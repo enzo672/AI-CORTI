@@ -20,7 +20,21 @@ import json
 from pathlib import Path
 from typing import Union
 
+import numpy as np
 import pandas as pd
+
+
+def _compute_age(dob_str: str | None, visit_date) -> float:
+    """Âge en années décimales à la date de visite."""
+    if not dob_str or visit_date is None:
+        return np.nan
+    try:
+        dob = pd.to_datetime(dob_str.replace("/", "-"))
+        if hasattr(visit_date, "tzinfo") and visit_date.tzinfo is not None:
+            dob = dob.tz_localize("UTC")
+        return float((visit_date - dob).days / 365.25)
+    except Exception:
+        return np.nan
 
 
 def _parse_mongo_value(val):
@@ -61,44 +75,61 @@ def _parse_dots(dots_list: list) -> dict:
 
 def load_record(record: dict) -> dict:
     """
-    Parse un record JSON MongoDB en dict plat exploitable pour le ML.
+    Parse un record JSON en dict plat exploitable pour le ML.
 
-    Retourne None si le record est supprimé ou invalide.
+    Supporte deux formats :
+    - Ancien format MongoDB (présence de "_id", "isDeleted", "testValidity")
+    - Nouveau format CORTI (category + visitDate ISO + snapshot.patient)
+
+    Retourne None si le record est supprimé ou invalide (ancien format uniquement).
     """
-    if record.get("isDeleted", False):
-        return None
+    is_mongodb = "_id" in record
 
-    data = record.get("data", {})
-    audiogramme = data.get("audiogramme", {})
-    divers = data.get("divers", {})
+    if is_mongodb:
+        if record.get("isDeleted", False):
+            return None
+        data = record.get("data", {})
+        divers = data.get("divers", {})
+        if divers.get("testValidity", 0) != 0:
+            return None
+        audiogramme = data.get("audiogramme", {})
 
-    test_validity = divers.get("testValidity", 0)
-    if test_validity != 0:
-        return None
+        visit_date = _parse_mongo_value(record.get("visitDate", {}))
+        patient = record.get("patient")
+        record_id = _parse_mongo_value(record.get("_id", {}))
+        gender = None
+        age_at_visit = np.nan
+    else:
+        # Format CORTI : visitDate ISO, démographie dans snapshot.patient
+        data = record.get("data") or {}
+        audiogramme = data.get("audiogramme", {})
+
+        visit_date_raw = record.get("visitDate")
+        visit_date = pd.to_datetime(visit_date_raw, utc=True) if visit_date_raw else None
+
+        snapshot = record.get("snapshot") or {}
+        patient_info = snapshot.get("patient") or {}
+        dob = patient_info.get("dob") or ""
+        gender_raw = patient_info.get("gender")
+        # Encodage Odyo : 1 = homme, 2 = femme
+        gender = int(gender_raw) if gender_raw is not None else None
+        age_at_visit = _compute_age(dob, visit_date)
+
+        # Identifiant patient synthétique (dob + genre — meilleure approximation sans _id)
+        patient = f"{dob}_{gender}"
+        record_id = None
 
     dots = audiogramme.get("dots", {})
     dots_left = _parse_dots(dots.get("left", []))
     dots_right = _parse_dots(dots.get("right", []))
 
-    hearing_line = audiogramme.get("hearingLine")
-    try:
-        hearing_line = float(hearing_line) if hearing_line not in (None, "") else None
-    except (ValueError, TypeError):
-        hearing_line = None
-
-    prev_report_id = audiogramme.get("prevReportId") or None
-
     return {
-        "record_id": _parse_mongo_value(record.get("_id", {})),
-        "patient": record.get("patient"),
+        "record_id": record_id,
+        "patient": patient,
         "visit_category": record.get("category"),   # 0=Baseline, 1=Periodic, 2=Depart
-        "data_type": data.get("type"),
-        "version": record.get("version"),
-        "visit_date": _parse_mongo_value(record.get("visitDate", {})),
-        "report_date": divers.get("reportDate"),
-        "evaluation_mode": audiogramme.get("evaluationMode"),
-        "hearing_line": hearing_line,
-        "prev_report_id": prev_report_id,
+        "visit_date": visit_date,
+        "gender": gender,          # 1=homme, 2=femme (encodage Odyo)
+        "age_at_visit": age_at_visit,
         "dots_left": dots_left,
         "dots_right": dots_right,
         "n_freqs_left": len(dots_left),
@@ -136,6 +167,7 @@ def load_dataset(data_dir: Union[str, Path]) -> pd.DataFrame:
         raise ValueError(f"Aucun record valide trouvé dans {data_dir}")
 
     df = pd.DataFrame(all_records)
-    df = df.drop_duplicates(subset=["record_id"])
+    if df["record_id"].notna().any():
+        df = df.drop_duplicates(subset=["record_id"])
     df = df.sort_values(["patient", "visit_date"]).reset_index(drop=True)
     return df

@@ -23,6 +23,79 @@ STS_FREQS = [2000, 3000, 4000]
 
 VISIT_CATEGORY_LABELS = {0: "Baseline", 1: "Periodic", 2: "Depart"}
 
+# ─── ISO 7029:2017 — Correction normative âge/genre ──────────────────────────
+#
+# Seuil auditif médian attendu (dB HL) au-dessus de la valeur à 18 ans :
+#   H'0.5(freq, age, genre) = a × max(age − 18, 0)^n
+#
+# Coefficients issus de l'ISO 7029:2017, Annexe A (Table A.1).
+# Genre : 1 = homme, 2 = femme (encodage Odyo).
+# Plage valide : 18–80 ans (clamp appliqué hors plage).
+
+ISO7029_COEFFS = {
+    1: {  # Homme
+        250:  {"a": 0.0320, "n": 1.92},
+        500:  {"a": 0.0400, "n": 1.92},
+        1000: {"a": 0.0640, "n": 1.92},
+        2000: {"a": 0.1100, "n": 2.00},
+        3000: {"a": 0.2500, "n": 1.90},
+        4000: {"a": 0.4800, "n": 1.80},
+        6000: {"a": 0.5400, "n": 1.70},
+        8000: {"a": 0.2800, "n": 1.90},
+    },
+    2: {  # Femme
+        250:  {"a": 0.0260, "n": 1.88},
+        500:  {"a": 0.0400, "n": 2.00},
+        1000: {"a": 0.0540, "n": 2.00},
+        2000: {"a": 0.0590, "n": 2.12},
+        3000: {"a": 0.0980, "n": 2.02},
+        4000: {"a": 0.1700, "n": 1.99},
+        6000: {"a": 0.3600, "n": 1.82},
+        8000: {"a": 0.3400, "n": 1.84},
+    },
+}
+
+ISO7029_AGE_MIN = 18
+ISO7029_AGE_MAX = 80
+
+
+# ─── ISO 7029 ────────────────────────────────────────────────────────────────
+
+def iso7029_expected(freq: int, age: float, gender: int) -> float:
+    """
+    Seuil auditif médian attendu (dB HL) selon ISO 7029:2017.
+
+    Représente la perte liée à l'âge et au genre pour un sujet otologiquement
+    normal. Utilisé pour calculer des résidus (seuil mesuré − seuil attendu).
+
+    freq   : fréquence en Hz (doit être dans ISO7029_COEFFS)
+    age    : âge en années (clampé à [18, 80])
+    gender : 1 = homme, 2 = femme
+    Retourne NaN si freq ou gender inconnu.
+    """
+    coeffs = ISO7029_COEFFS.get(gender, {}).get(freq)
+    if coeffs is None:
+        return np.nan
+    theta = max(0.0, min(float(age), ISO7029_AGE_MAX) - ISO7029_AGE_MIN)
+    return coeffs["a"] * (theta ** coeffs["n"])
+
+
+def apply_iso7029_correction(thresholds: dict, age: float, gender: int) -> dict:
+    """
+    Soustrait le seuil attendu ISO 7029 à chaque fréquence.
+
+    Résidu ≈ 0  → audition normale pour cet âge/genre
+    Résidu > 0  → perte au-delà de la norme → suspect
+    Résidu < 0  → meilleure audition que la norme
+
+    Les fréquences sans coefficient ISO (ex. 3000 Hz) sont laissées brutes.
+    """
+    corrected = {}
+    for freq, db_val in thresholds.items():
+        expected = iso7029_expected(int(freq), age, gender)
+        corrected[freq] = (db_val - expected) if not np.isnan(expected) else db_val
+    return corrected
+
 
 # ─── Fonctions de base ────────────────────────────────────────────────────────
 
@@ -91,9 +164,29 @@ def compute_sts(current_dots: dict, baseline_dots: dict) -> float:
 # ─── Features absolues (par record) ──────────────────────────────────────────
 
 def extract_features(row: pd.Series) -> dict:
-    """Construit le vecteur de features absolues pour un seul record."""
+    """
+    Construit le vecteur de features pour un seul record.
+
+    Si age_at_visit et gender sont disponibles, les seuils sont corrigés
+    selon ISO 7029:2017 (résidu = mesuré − attendu pour cet âge/genre).
+    Sinon, les seuils bruts sont utilisés.
+    """
     left_thresh = interpolate_thresholds(row["dots_left"], STANDARD_FREQS)
     right_thresh = interpolate_thresholds(row["dots_right"], STANDARD_FREQS)
+
+    age = row.get("age_at_visit")
+    gender = row.get("gender")
+
+    age_valid = age is not None and not (isinstance(age, float) and np.isnan(age))
+    gender_valid = (
+        gender is not None
+        and not (isinstance(gender, float) and np.isnan(gender))
+        and int(gender) in ISO7029_COEFFS
+    )
+
+    if age_valid and gender_valid:
+        left_thresh = apply_iso7029_correction(left_thresh, float(age), int(gender))
+        right_thresh = apply_iso7029_correction(right_thresh, float(age), int(gender))
 
     features = {}
     for freq in STANDARD_FREQS:
@@ -105,8 +198,9 @@ def extract_features(row: pd.Series) -> dict:
     features["high_freq_drop_L"] = compute_high_freq_drop(left_thresh)
     features["high_freq_drop_R"] = compute_high_freq_drop(right_thresh)
     features["asymmetry_mean"] = compute_asymmetry(left_thresh, right_thresh)
-    features["hearing_line"] = row.get("hearing_line", np.nan)
-    features["evaluation_mode"] = float(row.get("evaluation_mode", 0) or 0)
+
+    features["age_at_visit"] = float(age) if age_valid else np.nan
+    features["gender"] = float(gender) if gender_valid else np.nan
     features["n_freqs_left"] = float(row.get("n_freqs_left", 0))
     features["n_freqs_right"] = float(row.get("n_freqs_right", 0))
 
