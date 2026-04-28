@@ -92,7 +92,7 @@ def build_features(df: pd.DataFrame, mode: str):
         X, scaler, imputer = preprocess(feature_df, fit=True)
         df_pipeline = df
         print(f"  Shape matrice : {X.shape} — {len(feature_cols)} features")
-        return X, df_pipeline, scaler, imputer
+        return X, df_pipeline, feature_df, scaler, imputer
 
     # mode == "delta"
     feature_df, feature_cols = build_feature_matrix(df)
@@ -113,9 +113,10 @@ def build_features(df: pd.DataFrame, mode: str):
     else:
         X, scaler, imputer = preprocess(delta_df[delta_mask], fit=True)
         df_pipeline = df[delta_mask].reset_index(drop=True)
+        feature_df = feature_df[delta_mask].reset_index(drop=True)
 
     print(f"  Shape matrice : {X.shape}")
-    return X, df_pipeline, scaler, imputer
+    return X, df_pipeline, feature_df, scaler, imputer
 
 
 def save_outputs(
@@ -144,6 +145,7 @@ def generate_plots(
     df_pipeline: pd.DataFrame,
     scores_df: pd.DataFrame,
     X: np.ndarray,
+    loss_history: list,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -206,6 +208,17 @@ def generate_plots(
     except Exception as e:
         print(f"  UMAP ignoré : {e}")
 
+    # Courbe de loss autoencoder
+    _, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(range(1, len(loss_history) + 1), loss_history, linewidth=1.5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE Loss")
+    ax.set_title("Courbe d'entraînement — Autoencoder")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(figures_dir / "loss_curve.png", dpi=120)
+    plt.close()
+
     print(f"Figures sauvegardées → {figures_dir}/")
 
 
@@ -220,27 +233,61 @@ def main() -> None:
     output_dir = Path(args.output_dir)
 
     df = load_data(data_path)
-    X, df_pipeline, scaler, imputer = build_features(df, args.mode)
+    X, df_pipeline, feature_df, scaler, imputer = build_features(df, args.mode)
 
     print("\nLancement du pipeline non supervisé...")
     from src.models.unsupervised import run_unsupervised_pipeline
 
-    scores_df, if_model, ae_model = run_unsupervised_pipeline(
+    scores_df, if_model, ae_model, loss_history = run_unsupervised_pipeline(
         X,
         contamination=args.contamination,
         ae_epochs=args.epochs,
         device=args.device,
     )
 
+    # Règle clinique NIHL : encoche > 15 dB à 4kHz (Coles et al. 2000)
+    nihl_flag = (
+        (feature_df["notch_4k_L"].fillna(0) > 15) |
+        (feature_df["notch_4k_R"].fillna(0) > 15)
+    ).astype(int)
+    nihl_flag.index = scores_df.index
+
+    # Règle clinique Ménière : PTA BF corrigé > 25 dB (résidu vs norme âge/genre)
+    # Utilise les seuils corrigés ISO 7029 pour neutraliser la presbyacousie naturelle
+    low_L = feature_df[["L_250", "L_500", "L_1000"]].mean(axis=1)
+    low_R = feature_df[["R_250", "R_500", "R_1000"]].mean(axis=1)
+    meniere_flag = ((low_L.fillna(0) > 25) | (low_R.fillna(0) > 25)).astype(int)
+    meniere_flag.index = scores_df.index
+
+    scores_df["nihl_flag"]    = nihl_flag
+    scores_df["meniere_flag"] = meniere_flag
+    scores_df["anomaly_final"] = (
+        (scores_df["anomaly_consensus"] == 1) |
+        (scores_df["nihl_flag"] == 1) |
+        (scores_df["meniere_flag"] == 1)
+    ).astype(int)
+
     print("\n=== Résultats ===")
     from src.evaluate import summary_report
     summary_report(df_pipeline, scores_df)
+
+    from src.iso7029_validation import (
+        compute_iso7029_residuals,
+        compute_precision_at_iso7029,
+        print_iso7029_report,
+    )
+    residuals_df = compute_iso7029_residuals(df_pipeline)
+    iso_metrics = compute_precision_at_iso7029(residuals_df, scores_df)
+    print_iso7029_report(iso_metrics)
 
     save_outputs(output_dir, scores_df, if_model, ae_model, scaler, imputer)
 
     if not args.no_plots:
         print("\nGénération des figures...")
-        generate_plots(output_dir, df_pipeline, scores_df, X)
+        generate_plots(output_dir, df_pipeline, scores_df, X, loss_history)
+
+        from src.iso7029_validation import plot_iso7029_validation
+        plot_iso7029_validation(residuals_df, scores_df, output_dir)
 
     print("\nTerminé.")
 

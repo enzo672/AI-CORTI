@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Roadmap IA — Stage CORTI</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 48px 32px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 56px;
+    }
+
+    header h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      color: #f8fafc;
+      letter-spacing: -0.5px;
+    }
+
+    header p {
+      margin-top: 8px;
+      color: #94a3b8;
+      font-size: 0.95rem;
+    }
+
+    .badge {
+      display: inline-block;
+      margin-top: 16px;
+      background: #1e3a5f;
+      color: #60a5fa;
+      border: 1px solid #2563eb44;
+      padding: 4px 14px;
+      border-radius: 99px;
+      font-size: 0.8rem;
+      font-weight: 500;
+    }
+
+    /* Timeline */
+    .timeline {
+      position: relative;
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    .timeline::before {
+      content: '';
+      position: absolute;
+      left: 28px;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: linear-gradient(to bottom, #2563eb, #7c3aed, #0891b2, #059669);
+      border-radius: 2px;
+    }
+
+    .phase {
+      position: relative;
+      margin-bottom: 40px;
+      padding-left: 74px;
+    }
+
+    .phase-icon {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 58px;
+      height: 58px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      border: 3px solid #1e293b;
+      flex-shrink: 0;
+    }
+
+    .phase-card {
+      background: #1e293b;
+      border-radius: 14px;
+      padding: 22px 26px;
+      border: 1px solid #334155;
+      transition: border-color 0.2s;
+    }
+
+    .phase-card:hover {
+      border-color: #475569;
+    }
+
+    .phase-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .phase-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: #f1f5f9;
+    }
+
+    .phase-date {
+      font-size: 0.78rem;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 99px;
+      white-space: nowrap;
+    }
+
+    .phase-desc {
+      color: #94a3b8;
+      font-size: 0.9rem;
+      line-height: 1.65;
+    }
+
+    .tag-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 14px;
+    }
+
+    .tag {
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 2px 10px;
+      border-radius: 99px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      color: #cbd5e1;
+    }
+
+    /* Phase colors */
+    .p1 .phase-icon { background: #1d4ed8; }
+    .p1 .phase-date { background: #1e3a5f; color: #60a5fa; }
+
+    .p2 .phase-icon { background: #6d28d9; }
+    .p2 .phase-date { background: #2e1065; color: #a78bfa; }
+
+    .p3 .phase-icon { background: #0e7490; }
+    .p3 .phase-date { background: #0c1a2e; color: #38bdf8; }
+
+    .p4 .phase-icon { background: #047857; }
+    .p4 .phase-date { background: #052e16; color: #34d399; }
+
+    /* Progress bar */
+    .progress-wrap {
+      margin-top: 14px;
+    }
+
+    .progress-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.72rem;
+      color: #64748b;
+      margin-bottom: 4px;
+    }
+
+    .progress-bar {
+      height: 5px;
+      background: #0f172a;
+      border-radius: 99px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 99px;
+    }
+
+    .p1 .progress-fill { background: #2563eb; width: 30%; }
+    .p2 .progress-fill { background: #7c3aed; width: 0%; }
+    .p3 .progress-fill { background: #0891b2; width: 0%; }
+    .p4 .progress-fill { background: #059669; width: 0%; }
+
+    /* Summary bar */
+    .summary {
+      max-width: 860px;
+      margin: 48px auto 0;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 14px;
+      padding: 22px 26px;
+    }
+
+    .summary h2 {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 18px;
+    }
+
+    .gantt {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 8px 16px;
+      align-items: center;
+      font-size: 0.82rem;
+    }
+
+    .gantt-label {
+      color: #94a3b8;
+      text-align: right;
+    }
+
+    .gantt-track {
+      background: #0f172a;
+      border-radius: 99px;
+      height: 18px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .gantt-bar {
+      position: absolute;
+      top: 0;
+      height: 100%;
+      border-radius: 99px;
+      display: flex;
+      align-items: center;
+      padding-left: 8px;
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+    }
+
+    .g1 { left: 0%; width: 11%; background: #2563eb; }
+    .g2 { left: 11%; width: 44%; background: #7c3aed; }
+    .g3 { left: 55%; width: 30%; background: #0891b2; }
+    .g4 { left: 55%; width: 45%; background: #05966966; border: 1px solid #34d399; color: #34d399; }
+
+    .gantt-months {
+      grid-column: 2;
+      display: flex;
+      justify-content: space-between;
+      color: #475569;
+      font-size: 0.7rem;
+      margin-top: 4px;
+    }
+
+    footer {
+      text-align: center;
+      margin-top: 48px;
+      color: #334155;
+      font-size: 0.78rem;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Roadmap — Intelligence Artificielle Audiologique</h1>
+  <p>Plan de développement du système IA pour l'analyse des audiogrammes cliniques</p>
+  <span class="badge">Stage CORTI · Démarrage : 28 avril 2026</span>
+</header>
+
+<div class="timeline">
+
+  <!-- PHASE 1 -->
+  <div class="phase p1">
+    <div class="phase-icon">🧠</div>
+    <div class="phase-card">
+      <div class="phase-header">
+        <div class="phase-title">Phase 1 — Premiers entraînements sur données cliniques</div>
+        <div class="phase-date">Semaines 1–2 · 28 avr → 11 mai 2026</div>
+      </div>
+      <div class="phase-desc">
+        Entraînement des premiers modèles d'apprentissage automatique sur le jeu de données audiologiques cliniques internes (500+ audiogrammes annotés). Validation des architectures, sélection des features pertinentes (PTA, STS, catégories ISO 7029) et évaluation des performances initiales.
+      </div>
+      <div class="tag-list">
+        <span class="tag">Données internes</span>
+        <span class="tag">Feature engineering</span>
+        <span class="tag">Modèles de classification</span>
+        <span class="tag">Métriques de performance</span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-label"><span>Avancement</span><span>En cours</span></div>
+        <div class="progress-bar"><div class="progress-fill"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 2 -->
+  <div class="phase p2">
+    <div class="phase-icon">📊</div>
+    <div class="phase-card">
+      <div class="phase-header">
+        <div class="phase-title">Phase 2 — Adaptation aux données à grande échelle</div>
+        <div class="phase-date">1 à 2 mois · 12 mai → juil. 2026</div>
+      </div>
+      <div class="phase-desc">
+        Extension et réentraînement des modèles sur des bases de données larges (Odyo Soft, partenaires externes, etc.). Travail de normalisation cross-sources, gestion de la variabilité inter-cliniques, et amélioration de la robustesse et de la généralisation du modèle.
+      </div>
+      <div class="tag-list">
+        <span class="tag">Odyo Soft</span>
+        <span class="tag">Multi-sources</span>
+        <span class="tag">Normalisation</span>
+        <span class="tag">Généralisation</span>
+        <span class="tag">Scalabilité</span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-label"><span>Avancement</span><span>Planifié</span></div>
+        <div class="progress-bar"><div class="progress-fill"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 3 -->
+  <div class="phase p3">
+    <div class="phase-icon">🖥️</div>
+    <div class="phase-card">
+      <div class="phase-header">
+        <div class="phase-title">Phase 3 — Intégration serveur & déploiement</div>
+        <div class="phase-date">Juil. → fin de stage · 2026</div>
+      </div>
+      <div class="phase-desc">
+        Packaging du système IA, exposition via API, et déploiement sur infrastructure serveur. Tests de charge, sécurité des données médicales (RGPD), documentation technique et monitoring des inférences en production.
+      </div>
+      <div class="tag-list">
+        <span class="tag">API REST</span>
+        <span class="tag">Déploiement serveur</span>
+        <span class="tag">RGPD / Sécurité</span>
+        <span class="tag">Monitoring</span>
+        <span class="tag">Documentation</span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-label"><span>Avancement</span><span>Planifié</span></div>
+        <div class="progress-bar"><div class="progress-fill"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 4 -->
+  <div class="phase p4">
+    <div class="phase-icon">💬</div>
+    <div class="phase-card">
+      <div class="phase-header">
+        <div class="phase-title">Phase 4 — Exploration : Assistant IA personnalisé (à discuter)</div>
+        <div class="phase-date">Parallèle Phase 3 · Ouvert</div>
+      </div>
+      <div class="phase-desc">
+        Discussion ouverte avec les business developers et les équipes produit sur la pertinence d'intégrer un assistant conversationnel IA directement sur la plateforme. Définition du périmètre fonctionnel, des cas d'usage cliniques et de la faisabilité technique selon les retours métiers.
+      </div>
+      <div class="tag-list">
+        <span class="tag">Business Dev</span>
+        <span class="tag">Assistant conversationnel</span>
+        <span class="tag">Intégration plateforme</span>
+        <span class="tag">À définir ensemble</span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-label"><span>Avancement</span><span>En discussion</span></div>
+        <div class="progress-bar"><div class="progress-fill"></div></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- GANTT SUMMARY -->
+<div class="summary">
+  <h2>Vue d'ensemble — Calendrier prévisionnel</h2>
+  <div class="gantt">
+    <div class="gantt-label">Données cliniques</div>
+    <div class="gantt-track"><div class="gantt-bar g1">Sem. 1–2</div></div>
+
+    <div class="gantt-label">Données larges (ML)</div>
+    <div class="gantt-track"><div class="gantt-bar g2">1 à 2 mois</div></div>
+
+    <div class="gantt-label">Intégration serveur</div>
+    <div class="gantt-track"><div class="gantt-bar g3">Déploiement</div></div>
+
+    <div class="gantt-label">Assistant IA</div>
+    <div class="gantt-track"><div class="gantt-bar g4">À discuter</div></div>
+
+    <div></div>
+    <div class="gantt-months">
+      <span>Avr</span><span>Mai</span><span>Juin</span><span>Juil</span><span>Août</span><span>Sep</span>
+    </div>
+  </div>
+</div>
+
+<footer>
+  Enzo Kara · Stage IA Audiologique · 2026 · enzo.kara@etu.unistra.fr
+</footer>
+
+</body>
+</html>

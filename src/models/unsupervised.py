@@ -88,11 +88,11 @@ def train_autoencoder(
     batch_size: int = 32,
     lr: float = 1e-3,
     device: str = "cpu",
-) -> Autoencoder:
+) -> tuple["Autoencoder", list[float]]:
     """
     Entraîne l'Autoencoder sur les données X (supposées majoritairement normales).
 
-    Retourne le modèle entraîné.
+    Retourne le modèle entraîné et l'historique de loss (une valeur par epoch).
     """
     input_dim = X.shape[1]
     model = Autoencoder(input_dim, hidden_dim, latent_dim).to(device)
@@ -103,6 +103,7 @@ def train_autoencoder(
     dataset = torch.utils.data.TensorDataset(X_tensor)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    loss_history = []
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
@@ -113,11 +114,12 @@ def train_autoencoder(
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+        avg = total_loss / len(loader)
+        loss_history.append(avg)
         if (epoch + 1) % 20 == 0:
-            avg = total_loss / len(loader)
             print(f"  Epoch {epoch+1}/{epochs} — loss: {avg:.4f}")
 
-    return model
+    return model, loss_history
 
 
 def score_autoencoder(model: Autoencoder, X: np.ndarray, device: str = "cpu") -> pd.DataFrame:
@@ -178,7 +180,7 @@ def run_unsupervised_pipeline(
     if_scores = score_isolation_forest(if_model, X)
 
     print("→ Autoencoder...")
-    ae_model = train_autoencoder(X, epochs=ae_epochs, device=device)
+    ae_model, loss_history = train_autoencoder(X, epochs=ae_epochs, device=device)
     ae_scores = score_autoencoder(ae_model, X, device=device)
 
     print("→ PCA baseline...")
@@ -194,4 +196,4 @@ def run_unsupervised_pipeline(
         >= 2
     ).astype(int)
 
-    return scores_df, if_model, ae_model
+    return scores_df, if_model, ae_model, loss_history

@@ -17,6 +17,9 @@ STANDARD_FREQS = [250, 500, 1000, 2000, 4000, 8000]
 
 PTA_FREQS = [500, 1000, 2000, 4000]
 
+# Barany Society 2015 : PTA basses fréquences ≥ 25 dB HL → patron Ménière
+LOW_FREQ_PTA_FREQS = [250, 500, 1000]
+
 # Standard Threshold Shift (OSHA) : moyenne à 2000, 3000, 4000 Hz
 # ≥ 10 dB = shift cliniquement significatif
 STS_FREQS = [2000, 3000, 4000]
@@ -153,6 +156,41 @@ def compute_high_freq_drop(thresholds: dict) -> float:
     return float(v8 - v4)
 
 
+def compute_notch_4k(thresholds: dict) -> float:
+    """
+    Profondeur de l'encoche à 4 kHz (signature NIHL).
+
+    Formule : T(4kHz) − moyenne(T(2kHz), T(8kHz))
+
+    Valeur positive = 4kHz spécifiquement élevé par rapport à ses voisins → patron NIHL.
+    Valeur proche de 0 = perte uniforme (presbyacousie) ou audition normale.
+    Seuil clinique indicatif : > 15 dB.
+
+    Contrairement à high_freq_drop (8kHz − 4kHz), ce feature capture les deux
+    côtés de la chute et n'est pas biaisé par une perte générale haute fréquence.
+    """
+    v2 = thresholds.get(2000, np.nan)
+    v4 = thresholds.get(4000, np.nan)
+    v8 = thresholds.get(8000, np.nan)
+    if np.isnan(v4) or (np.isnan(v2) and np.isnan(v8)):
+        return np.nan
+    neighbors = [v for v in (v2, v8) if not np.isnan(v)]
+    return float(v4 - np.mean(neighbors))
+
+
+def compute_low_freq_pta(thresholds: dict) -> float:
+    """
+    PTA basses fréquences (250, 500, 1000 Hz) en seuils absolus (dB HL).
+
+    Doit être calculé sur les seuils bruts AVANT correction ISO 7029.
+    Critère Barany Society 2015 : valeur ≥ 25 dB HL sur l'oreille atteinte
+    = patron audiométrique de la maladie de Ménière.
+    """
+    values = [thresholds[f] for f in LOW_FREQ_PTA_FREQS
+              if not np.isnan(thresholds.get(f, np.nan))]
+    return float(np.mean(values)) if values else np.nan
+
+
 def compute_asymmetry(left_thresh: dict, right_thresh: dict) -> float:
     """Asymétrie inter-oreilles : moyenne de |OG − OD| sur les fréquences communes."""
     diffs = []
@@ -190,8 +228,8 @@ def extract_features(row: pd.Series) -> dict:
     selon ISO 7029:2017 (résidu = mesuré − attendu pour cet âge/genre).
     Sinon, les seuils bruts sont utilisés.
     """
-    left_thresh = interpolate_thresholds(row["dots_left"], STANDARD_FREQS)
-    right_thresh = interpolate_thresholds(row["dots_right"], STANDARD_FREQS)
+    left_thresh_raw  = interpolate_thresholds(row["dots_left"],  STANDARD_FREQS)
+    right_thresh_raw = interpolate_thresholds(row["dots_right"], STANDARD_FREQS)
 
     age = row.get("age_at_visit")
     gender = row.get("gender")
@@ -204,8 +242,11 @@ def extract_features(row: pd.Series) -> dict:
     )
 
     if age_valid and gender_valid:
-        left_thresh = apply_age_correction(left_thresh, float(age), int(gender))
-        right_thresh = apply_age_correction(right_thresh, float(age), int(gender))
+        left_thresh  = apply_age_correction(left_thresh_raw,  float(age), int(gender))
+        right_thresh = apply_age_correction(right_thresh_raw, float(age), int(gender))
+    else:
+        left_thresh  = left_thresh_raw
+        right_thresh = right_thresh_raw
 
     features = {}
     for freq in STANDARD_FREQS:
@@ -216,6 +257,11 @@ def extract_features(row: pd.Series) -> dict:
     features["PTA_R"] = compute_pta(right_thresh)
     features["high_freq_drop_L"] = compute_high_freq_drop(left_thresh)
     features["high_freq_drop_R"] = compute_high_freq_drop(right_thresh)
+    features["notch_4k_L"] = compute_notch_4k(left_thresh)
+    features["notch_4k_R"] = compute_notch_4k(right_thresh)
+    # Seuils absolus avant correction — critère Barany Society 2015 (Ménière)
+    features["low_freq_pta_L"] = compute_low_freq_pta(left_thresh_raw)
+    features["low_freq_pta_R"] = compute_low_freq_pta(right_thresh_raw)
     features["asymmetry_mean"] = compute_asymmetry(left_thresh, right_thresh)
 
     features["age_at_visit"] = float(age) if age_valid else np.nan
