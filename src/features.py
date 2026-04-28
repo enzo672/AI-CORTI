@@ -23,76 +23,95 @@ STS_FREQS = [2000, 3000, 4000]
 
 VISIT_CATEGORY_LABELS = {0: "Baseline", 1: "Periodic", 2: "Depart"}
 
-# ─── ISO 7029:2017 — Correction normative âge/genre ──────────────────────────
+# ─── Correction normative âge/genre (OSHA 29 CFR 1910.95 Appendix F) ─────────
 #
-# Seuil auditif médian attendu (dB HL) au-dessus de la valeur à 18 ans :
-#   H'0.5(freq, age, genre) = a × max(age − 18, 0)^n
+# Tables de correction en dB HL pour chaque fréquence, âge et genre.
+# Source : OSHA Appendix F (Table F-1 hommes, Table F-2 femmes).
+# Couverture : 1000–6000 Hz, âges 20–60 ans.
 #
-# Coefficients issus de l'ISO 7029:2017, Annexe A (Table A.1).
+# Pour 250, 500, 8000 Hz (hors table OSHA) : estimations cliniques
+# basées sur la littérature audiométrique (effet d'âge moindre en BF,
+# légèrement inférieur à 6000 Hz en HF).
+#
 # Genre : 1 = homme, 2 = femme (encodage Odyo).
-# Plage valide : 18–80 ans (clamp appliqué hors plage).
+# Usage : residual = seuil_mesuré − correction_attendue(age, freq, gender)
+#   ≈ 0   → audition normale pour cet âge/genre
+#   > 0   → perte au-delà de la norme → suspect
+#   < 0   → meilleure audition que la norme
 
-ISO7029_COEFFS = {
-    1: {  # Homme
-        250:  {"a": 0.0320, "n": 1.92},
-        500:  {"a": 0.0400, "n": 1.92},
-        1000: {"a": 0.0640, "n": 1.92},
-        2000: {"a": 0.1100, "n": 2.00},
-        3000: {"a": 0.2500, "n": 1.90},
-        4000: {"a": 0.4800, "n": 1.80},
-        6000: {"a": 0.5400, "n": 1.70},
-        8000: {"a": 0.2800, "n": 1.90},
+OSHA_CORRECTIONS = {
+    1: {  # Hommes — Table F-1
+        #  freq :  {age: correction_dB}
+        250:  {20: 2,  25: 2,  30: 3,  35: 3,  40: 4,  45: 5,  50: 6,  55: 7,  60: 8},
+        500:  {20: 3,  25: 3,  30: 4,  35: 4,  40: 5,  45: 6,  50: 7,  55: 8,  60: 9},
+        1000: {20: 5,  25: 5,  30: 6,  35: 7,  40: 7,  45: 8,  50: 9,  55: 10, 60: 11},
+        2000: {20: 3,  25: 3,  30: 4,  35: 5,  40: 6,  45: 7,  50: 9,  55: 11, 60: 13},
+        3000: {20: 4,  25: 5,  30: 6,  35: 8,  40: 10, 45: 13, 50: 16, 55: 19, 60: 23},
+        4000: {20: 5,  25: 7,  30: 9,  35: 11, 40: 14, 45: 18, 50: 22, 55: 27, 60: 33},
+        6000: {20: 8,  25: 10, 30: 12, 35: 15, 40: 19, 45: 23, 50: 27, 55: 32, 60: 38},
+        8000: {20: 7,  25: 9,  30: 11, 35: 14, 40: 17, 45: 21, 50: 25, 55: 29, 60: 34},
     },
-    2: {  # Femme
-        250:  {"a": 0.0260, "n": 1.88},
-        500:  {"a": 0.0400, "n": 2.00},
-        1000: {"a": 0.0540, "n": 2.00},
-        2000: {"a": 0.0590, "n": 2.12},
-        3000: {"a": 0.0980, "n": 2.02},
-        4000: {"a": 0.1700, "n": 1.99},
-        6000: {"a": 0.3600, "n": 1.82},
-        8000: {"a": 0.3400, "n": 1.84},
+    2: {  # Femmes — Table F-2
+        250:  {20: 2,  25: 2,  30: 3,  35: 3,  40: 3,  45: 4,  50: 4,  55: 5,  60: 6},
+        500:  {20: 3,  25: 3,  30: 4,  35: 4,  40: 4,  45: 5,  50: 5,  55: 6,  60: 7},
+        1000: {20: 7,  25: 8,  30: 8,  35: 9,  40: 10, 45: 11, 50: 12, 55: 13, 60: 14},
+        2000: {20: 4,  25: 5,  30: 6,  35: 6,  40: 7,  45: 8,  50: 10, 55: 11, 60: 12},
+        3000: {20: 3,  25: 4,  30: 5,  35: 7,  40: 8,  45: 10, 50: 11, 55: 14, 60: 16},
+        4000: {20: 3,  25: 4,  30: 5,  35: 7,  40: 8,  45: 10, 50: 12, 55: 14, 60: 17},
+        6000: {20: 6,  25: 7,  30: 9,  35: 11, 40: 13, 45: 15, 50: 17, 55: 19, 60: 22},
+        8000: {20: 6,  25: 7,  30: 8,  35: 10, 40: 12, 45: 14, 50: 16, 55: 18, 60: 21},
     },
 }
 
-ISO7029_AGE_MIN = 18
-ISO7029_AGE_MAX = 80
+OSHA_AGE_MIN = 20
+OSHA_AGE_MAX = 60
 
 
-# ─── ISO 7029 ────────────────────────────────────────────────────────────────
-
-def iso7029_expected(freq: int, age: float, gender: int) -> float:
+def age_correction_expected(freq: int, age: float, gender: int) -> float:
     """
-    Seuil auditif médian attendu (dB HL) selon ISO 7029:2017.
+    Seuil auditif attendu (dB HL) pour un sujet normal de cet âge et genre.
 
-    Représente la perte liée à l'âge et au genre pour un sujet otologiquement
-    normal. Utilisé pour calculer des résidus (seuil mesuré − seuil attendu).
+    Source : OSHA 29 CFR 1910.95 Appendix F (Table F-1 hommes, F-2 femmes)
+    pour 1000–6000 Hz, estimations cliniques pour 250, 500, 8000 Hz.
+    Interpolation linéaire entre les points de la table.
+    Age clampé à [20, 60].
 
-    freq   : fréquence en Hz (doit être dans ISO7029_COEFFS)
-    age    : âge en années (clampé à [18, 80])
-    gender : 1 = homme, 2 = femme
     Retourne NaN si freq ou gender inconnu.
     """
-    coeffs = ISO7029_COEFFS.get(gender, {}).get(freq)
-    if coeffs is None:
+    table = OSHA_CORRECTIONS.get(gender, {}).get(freq)
+    if table is None:
         return np.nan
-    theta = max(0.0, min(float(age), ISO7029_AGE_MAX) - ISO7029_AGE_MIN)
-    return coeffs["a"] * (theta ** coeffs["n"])
+
+    age_clamped = max(OSHA_AGE_MIN, min(float(age), OSHA_AGE_MAX))
+    ages = sorted(table.keys())
+
+    if age_clamped <= ages[0]:
+        return float(table[ages[0]])
+    if age_clamped >= ages[-1]:
+        return float(table[ages[-1]])
+
+    for i in range(len(ages) - 1):
+        a0, a1 = ages[i], ages[i + 1]
+        if a0 <= age_clamped <= a1:
+            t = (age_clamped - a0) / (a1 - a0)
+            return float(table[a0] + t * (table[a1] - table[a0]))
+
+    return np.nan
 
 
-def apply_iso7029_correction(thresholds: dict, age: float, gender: int) -> dict:
+def apply_age_correction(thresholds: dict, age: float, gender: int) -> dict:
     """
-    Soustrait le seuil attendu ISO 7029 à chaque fréquence.
+    Soustrait le seuil attendu (OSHA Appendix F) à chaque fréquence.
 
     Résidu ≈ 0  → audition normale pour cet âge/genre
     Résidu > 0  → perte au-delà de la norme → suspect
     Résidu < 0  → meilleure audition que la norme
 
-    Les fréquences sans coefficient ISO (ex. 3000 Hz) sont laissées brutes.
+    Les fréquences sans entrée dans la table sont laissées brutes.
     """
     corrected = {}
     for freq, db_val in thresholds.items():
-        expected = iso7029_expected(int(freq), age, gender)
+        expected = age_correction_expected(int(freq), age, gender)
         corrected[freq] = (db_val - expected) if not np.isnan(expected) else db_val
     return corrected
 
@@ -181,12 +200,12 @@ def extract_features(row: pd.Series) -> dict:
     gender_valid = (
         gender is not None
         and not (isinstance(gender, float) and np.isnan(gender))
-        and int(gender) in ISO7029_COEFFS
+        and int(gender) in OSHA_CORRECTIONS
     )
 
     if age_valid and gender_valid:
-        left_thresh = apply_iso7029_correction(left_thresh, float(age), int(gender))
-        right_thresh = apply_iso7029_correction(right_thresh, float(age), int(gender))
+        left_thresh = apply_age_correction(left_thresh, float(age), int(gender))
+        right_thresh = apply_age_correction(right_thresh, float(age), int(gender))
 
     features = {}
     for freq in STANDARD_FREQS:
