@@ -303,7 +303,7 @@ def plot_rule_distributions(
 
     Un seuil bien calibré coupe une vraie bimodalité, pas une zone de bruit.
     """
-    from src.features import STANDARD_FREQS
+    from src.features import STANDARD_FREQS, NIHL_NOTCH_THRESHOLD_DB
 
     panels = []
 
@@ -314,7 +314,7 @@ def plot_rule_distributions(
             feature_df[notch_cols_L].max(axis=1),
             feature_df[notch_cols_R].max(axis=1),
         ], axis=1).max(axis=1)
-        panels.append((notch_max, 15, "Encoche max (3/4/6 kHz) [dB]", "NIHL > 15 dB"))
+        panels.append((notch_max, NIHL_NOTCH_THRESHOLD_DB, "Encoche max (3/4/6 kHz) [dB]", f"NIHL > {NIHL_NOTCH_THRESHOLD_DB:.0f} dB"))
 
     if "low_freq_pta_L" in feature_df.columns and "low_freq_pta_R" in feature_df.columns:
         lf_max = feature_df[["low_freq_pta_L", "low_freq_pta_R"]].max(axis=1)
