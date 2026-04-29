@@ -37,6 +37,7 @@ from pathlib import Path
 from src.features import (
     STANDARD_FREQS,
     age_correction_expected,
+    compute_nihl_flag,
     extract_features,
     preprocess,
 )
@@ -286,11 +287,7 @@ def score_synthetic(synth_df: pd.DataFrame, models: dict,
 
     consensus = ((if_flags + ae_flags + pca_flags) >= 2).astype(int)
 
-    # Règle clinique NIHL : creux > 15 dB entre 2–8 kHz (dérivée discrète)
-    nihl_flag = (
-        (feature_df["notch_depth_L"].fillna(0) > 15) |
-        (feature_df["notch_depth_R"].fillna(0) > 15)
-    ).astype(int)
+    nihl_flag = compute_nihl_flag(feature_df)
 
     # Règle clinique Ménière : PTA BF corrigé > 25 dB (résidu vs norme âge/genre)
     low_L = feature_df[["L_250", "L_500", "L_1000"]].mean(axis=1)

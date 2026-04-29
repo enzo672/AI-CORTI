@@ -13,6 +13,8 @@ import torch.nn as nn
 from sklearn.ensemble import IsolationForest
 from sklearn.decomposition import PCA
 
+from src.features import compute_nihl_flag
+
 
 # ─── Isolation Forest ────────────────────────────────────────────────────────
 
@@ -197,11 +199,7 @@ def run_unsupervised_pipeline(
         >= 2
     ).astype(int)
 
-    # Règle clinique NIHL : creux > 15 dB entre 2–8 kHz (dérivée discrète)
     if feature_df is not None:
-        scores_df["nihl_flag"] = (
-            (feature_df["notch_depth_L"].fillna(0) > 15) |
-            (feature_df["notch_depth_R"].fillna(0) > 15)
-        ).astype(int).values
+        scores_df["nihl_flag"] = compute_nihl_flag(feature_df).values
 
     return scores_df, if_model, ae_model, loss_history

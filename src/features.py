@@ -207,9 +207,6 @@ def compute_notch_at_freq(thresholds: dict, freq: int, ref_lo: int, ref_hi: int)
 
     > 0  → le seuil à freq est pire que ses références → encoche
     ≤ 0  → pas d'encoche à cette fréquence
-
-    Avantage vs dérivée : ne requiert pas de changement de signe, donc capte les
-    audiogrammes NIHL sans récupération à 8 kHz (plateau après 4 kHz).
     """
     v    = thresholds.get(freq,    np.nan)
     v_lo = thresholds.get(ref_lo,  np.nan)
@@ -217,6 +214,57 @@ def compute_notch_at_freq(thresholds: dict, freq: int, ref_lo: int, ref_hi: int)
     if np.isnan(v) or np.isnan(v_lo) or np.isnan(v_hi):
         return np.nan
     return float(v - (v_lo + v_hi) / 2)
+
+
+# Seuil NIOSH 1998 / Coles et al. 2000 : profondeur d'encoche ≥ 15 dB = NIHL probable
+NIHL_NOTCH_THRESHOLD_DB: float = 15.0
+# Seuil absolu minimal : le seuil brut à la fréquence de l'encoche doit être ≥ 20 dB HL
+NIHL_ABS_FLOOR_DB: float = 20.0
+
+
+def compute_notch_4k_robust(
+    thresholds_corrected: dict,
+    thresholds_raw: dict,
+    abs_floor_db: float = NIHL_ABS_FLOOR_DB,
+) -> float:
+    """
+    Profondeur d'encoche à 4 kHz — version robuste (NIOSH 1998 / Coles et al. 2000).
+
+    Trois améliorations par rapport à compute_notch_at_freq(thresh, 4000, 2000, 8000) :
+
+    1. Plancher absolu : le seuil brut à 4 kHz doit être ≥ abs_floor_db (défaut 20 dB HL).
+       Une encoche à 5 dB HL n'est pas cliniquement pertinente.
+
+    2. Fallback référence haute : si T(8k) est absent, utilise T(6k).
+       Évite les NaN sur les audiogrammes sans mesure à 8 kHz.
+
+    3. Test V-shape : T(4k) doit être strictement pire que T(2k) ET pire que la
+       référence haute (T(6k) ou T(8k)). Élimine les slopes descendants où la
+       formule naïve donnerait un faux positif.
+
+    Retourne 0.0 si l'une des trois conditions n'est pas satisfaite.
+    """
+    v4_raw = thresholds_raw.get(4000, np.nan)
+    if np.isnan(v4_raw) or v4_raw < abs_floor_db:
+        return 0.0
+
+    v4 = thresholds_corrected.get(4000, np.nan)
+    v2 = thresholds_corrected.get(2000, np.nan)
+    if np.isnan(v4) or np.isnan(v2):
+        return 0.0
+
+    # Référence haute : 8 kHz prioritaire, 6 kHz en fallback
+    v_hi = thresholds_corrected.get(8000, np.nan)
+    if np.isnan(v_hi):
+        v_hi = thresholds_corrected.get(6000, np.nan)
+    if np.isnan(v_hi):
+        return 0.0
+
+    # V-shape : le creux doit être pire que ses deux voisins
+    if v4 <= v2 or v4 <= v_hi:
+        return 0.0
+
+    return float(v4 - (v2 + v_hi) / 2)
 
 
 def compute_low_freq_pta(thresholds: dict) -> float:
@@ -230,6 +278,32 @@ def compute_low_freq_pta(thresholds: dict) -> float:
     values = [thresholds[f] for f in LOW_FREQ_PTA_FREQS
               if not np.isnan(thresholds.get(f, np.nan))]
     return float(np.mean(values)) if values else np.nan
+
+
+def compute_nihl_flag(feature_df: pd.DataFrame) -> pd.Series:
+    """
+    Flag NIHL unifié — source unique de vérité pour le pipeline et les notebooks.
+
+    Remplace les implémentations dupliquées dans unsupervised.py et
+    synthetic_validation.py. Critère : au moins une oreille satisfait l'une
+    des deux conditions suivantes :
+
+      A. notch_depth > 15 dB (dérivée discrète) — capte tout creux local 2–8 kHz,
+         robuste si la récupération ne se fait pas exactement à 4 kHz.
+      B. nihl_notch_max > 15 dB (formule Coles directe sur 3/4/6 kHz,
+         avec V-shape + plancher absolu 20 dB HL).
+
+    Références : NIOSH 1998, Coles et al. 2000 (Br J Audiol).
+    """
+    depth_flag = (
+        (feature_df["notch_depth_L"].fillna(0) > NIHL_NOTCH_THRESHOLD_DB) |
+        (feature_df["notch_depth_R"].fillna(0) > NIHL_NOTCH_THRESHOLD_DB)
+    )
+    notch_flag = (
+        (feature_df["nihl_notch_max_L"].fillna(0) > NIHL_NOTCH_THRESHOLD_DB) |
+        (feature_df["nihl_notch_max_R"].fillna(0) > NIHL_NOTCH_THRESHOLD_DB)
+    )
+    return (depth_flag | notch_flag).astype(int)
 
 
 def compute_asymmetry(left_thresh: dict, right_thresh: dict) -> float:
@@ -301,12 +375,24 @@ def extract_features(row: pd.Series) -> dict:
     features["notch_depth_L"], features["notch_freq_L"] = compute_notch_derivative(left_thresh)
     features["notch_depth_R"], features["notch_freq_R"] = compute_notch_derivative(right_thresh)
 
-    # Encoches par comparaison directe aux fréquences de référence (Coles et al. 2000)
-    # Référence : (2kHz, 8kHz) pour 4kHz ; (2kHz, 4kHz) pour 3kHz ; (4kHz, 8kHz) pour 6kHz
-    for side, thresh in (("L", left_thresh), ("R", right_thresh)):
+    # Encoches par fréquence (Coles et al. 2000) — notch_4k utilise la version robuste
+    for side, thresh, thresh_raw in (
+        ("L", left_thresh, left_thresh_raw),
+        ("R", right_thresh, right_thresh_raw),
+    ):
         features[f"notch_3k_{side}"] = compute_notch_at_freq(thresh, 3000, 2000, 4000)
-        features[f"notch_4k_{side}"] = compute_notch_at_freq(thresh, 4000, 2000, 8000)
+        features[f"notch_4k_{side}"] = compute_notch_4k_robust(thresh, thresh_raw)
         features[f"notch_6k_{side}"] = compute_notch_at_freq(thresh, 6000, 4000, 8000)
+        # Max des trois fréquences NIHL (3/4/6 kHz) — utilisé par compute_nihl_flag
+        notch_vals = [
+            max(0.0, v) for v in (
+                features[f"notch_3k_{side}"],
+                features[f"notch_4k_{side}"],
+                features[f"notch_6k_{side}"],
+            )
+            if not np.isnan(v)
+        ]
+        features[f"nihl_notch_max_{side}"] = max(notch_vals) if notch_vals else np.nan
 
     # Seuils absolus avant correction — critère Barany Society 2015 (Ménière)
     features["low_freq_pta_L"] = compute_low_freq_pta(left_thresh_raw)
