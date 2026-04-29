@@ -199,6 +199,26 @@ def compute_notch_derivative(
     return best_depth, best_freq
 
 
+def compute_notch_at_freq(thresholds: dict, freq: int, ref_lo: int, ref_hi: int) -> float:
+    """
+    Profondeur d'encoche à `freq` par rapport à la moyenne de deux fréquences de référence.
+
+    depth = threshold[freq] - (threshold[ref_lo] + threshold[ref_hi]) / 2
+
+    > 0  → le seuil à freq est pire que ses références → encoche
+    ≤ 0  → pas d'encoche à cette fréquence
+
+    Avantage vs dérivée : ne requiert pas de changement de signe, donc capte les
+    audiogrammes NIHL sans récupération à 8 kHz (plateau après 4 kHz).
+    """
+    v    = thresholds.get(freq,    np.nan)
+    v_lo = thresholds.get(ref_lo,  np.nan)
+    v_hi = thresholds.get(ref_hi,  np.nan)
+    if np.isnan(v) or np.isnan(v_lo) or np.isnan(v_hi):
+        return np.nan
+    return float(v - (v_lo + v_hi) / 2)
+
+
 def compute_low_freq_pta(thresholds: dict) -> float:
     """
     PTA basses fréquences (250, 500, 1000 Hz) en seuils absolus (dB HL).
@@ -280,6 +300,14 @@ def extract_features(row: pd.Series) -> dict:
     features["high_freq_drop_R"] = compute_high_freq_drop(right_thresh)
     features["notch_depth_L"], features["notch_freq_L"] = compute_notch_derivative(left_thresh)
     features["notch_depth_R"], features["notch_freq_R"] = compute_notch_derivative(right_thresh)
+
+    # Encoches par comparaison directe aux fréquences de référence (Coles et al. 2000)
+    # Référence : (2kHz, 8kHz) pour 4kHz ; (2kHz, 4kHz) pour 3kHz ; (4kHz, 8kHz) pour 6kHz
+    for side, thresh in (("L", left_thresh), ("R", right_thresh)):
+        features[f"notch_3k_{side}"] = compute_notch_at_freq(thresh, 3000, 2000, 4000)
+        features[f"notch_4k_{side}"] = compute_notch_at_freq(thresh, 4000, 2000, 8000)
+        features[f"notch_6k_{side}"] = compute_notch_at_freq(thresh, 6000, 4000, 8000)
+
     # Seuils absolus avant correction — critère Barany Society 2015 (Ménière)
     features["low_freq_pta_L"] = compute_low_freq_pta(left_thresh_raw)
     features["low_freq_pta_R"] = compute_low_freq_pta(right_thresh_raw)

@@ -247,14 +247,17 @@ def main() -> None:
         device=args.device,
     )
 
-    # Règle NIHL : encoche > 15 dB à 3, 4 ou 6 kHz (Coles et al. 2000)
+    # Règle NIHL : encoche ≥ 10 dB à 3, 4 ou 6 kHz (Coles et al. 2000)
+    # Comparaison directe aux fréquences de référence — capte aussi les audiogrammes
+    # sans récupération à 8 kHz que la méthode dérivée manque.
+    _nihl_thr = 10
     nihl_flag = (
-        (feature_df["notch_3k_L"].fillna(0) > 15) |
-        (feature_df["notch_3k_R"].fillna(0) > 15) |
-        (feature_df["notch_4k_L"].fillna(0) > 15) |
-        (feature_df["notch_4k_R"].fillna(0) > 15) |
-        (feature_df["notch_6k_L"].fillna(0) > 15) |
-        (feature_df["notch_6k_R"].fillna(0) > 15)
+        (feature_df["notch_3k_L"].fillna(0) > _nihl_thr) |
+        (feature_df["notch_4k_L"].fillna(0) > _nihl_thr) |
+        (feature_df["notch_6k_L"].fillna(0) > _nihl_thr) |
+        (feature_df["notch_3k_R"].fillna(0) > _nihl_thr) |
+        (feature_df["notch_4k_R"].fillna(0) > _nihl_thr) |
+        (feature_df["notch_6k_R"].fillna(0) > _nihl_thr)
     ).astype(int)
     nihl_flag.index = scores_df.index
 
