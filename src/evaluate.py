@@ -76,7 +76,7 @@ def plot_patient_trajectory(
         return
 
     n = len(patient_df)
-    fig, axes = plt.subplots(1, n, figsize=(7 * n, 5), squeeze=False)
+    _, axes = plt.subplots(1, n, figsize=(7 * n, 5), squeeze=False)
 
     for i, (idx, row) in enumerate(patient_df.iterrows()):
         label = VISIT_LABELS.get(row.get("visit_category"), "?")
@@ -130,7 +130,7 @@ def plot_top_anomalies(
 ) -> None:
     """Trace les audiogrammes des N records les plus anormaux."""
     top_idx = scores.dropna().nlargest(n).index
-    fig, axes = plt.subplots(2, n // 2, figsize=(14, 8))
+    _, axes = plt.subplots(2, n // 2, figsize=(14, 8))
     axes = axes.flatten()
 
     for i, idx in enumerate(top_idx):
@@ -191,7 +191,7 @@ def plot_delta_heatmap(
 
 def plot_sts_distribution(delta_df: pd.DataFrame) -> None:
     """Distribution des STS (Standard Threshold Shift) OG et OD."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    _, axes = plt.subplots(1, 2, figsize=(12, 4))
     threshold = 10.0
 
     for ax, col, label in zip(axes, ["sts_L", "sts_R"], ["OG (gauche)", "OD (droite)"]):
@@ -248,6 +248,243 @@ def plot_umap(
     ax.set_title(title)
     ax.set_xlabel("UMAP 1")
     ax.set_ylabel("UMAP 2")
+    plt.tight_layout()
+
+
+# ─── Vérification sans vérité terrain ────────────────────────────────────────
+
+def plot_flag_overlap(scores_df: pd.DataFrame) -> None:
+    """
+    Matrices de confusion ML (consensus) vs chaque règle clinique.
+
+    Les cas flaggés par les deux mécanismes indépendants sont les plus fiables.
+    """
+    pairs = [
+        ("anomaly_consensus", "nihl_flag",    "NIHL"),
+        ("anomaly_consensus", "meniere_flag",  "Ménière"),
+        ("anomaly_consensus", "sts_flag",      "STS OSHA"),
+    ]
+    available = [(a, b, lbl) for a, b, lbl in pairs
+                 if a in scores_df.columns and b in scores_df.columns]
+    if not available:
+        print("Colonnes de flags manquantes dans scores_df.")
+        return
+
+    n = len(available)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4))
+    if n == 1:
+        axes = [axes]
+
+    for ax, (col_ml, col_rule, label) in zip(axes, available):
+        ml   = scores_df[col_ml].fillna(0).astype(int)
+        rule = scores_df[col_rule].fillna(0).astype(int)
+        matrix = pd.crosstab(
+            ml.map({0: "ML: normal", 1: "ML: anomalie"}),
+            rule.map({0: f"{label}: normal", 1: f"{label}: flag"}),
+        )
+        sns.heatmap(matrix, annot=True, fmt="d", cmap="Blues", ax=ax,
+                    linewidths=0.5, cbar=False)
+        ax.set_title(f"Consensus ML × {label}")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    plt.suptitle("Accord ML vs règles cliniques — cases diagonales = consensus",
+                 fontsize=11, y=1.02)
+    plt.tight_layout()
+
+
+def plot_rule_distributions(
+    feature_df: pd.DataFrame,
+    scores_df: pd.DataFrame,
+    delta_df: pd.DataFrame | None = None,
+) -> None:
+    """
+    Distribution de la métrique sous-jacente à chaque règle clinique.
+
+    Un seuil bien calibré coupe une vraie bimodalité, pas une zone de bruit.
+    """
+    from src.features import STANDARD_FREQS
+
+    panels = []
+
+    notch_cols_L = [c for c in ["notch_3k_L", "notch_4k_L", "notch_6k_L"] if c in feature_df.columns]
+    notch_cols_R = [c for c in ["notch_3k_R", "notch_4k_R", "notch_6k_R"] if c in feature_df.columns]
+    if notch_cols_L and notch_cols_R:
+        notch_max = pd.concat([
+            feature_df[notch_cols_L].max(axis=1),
+            feature_df[notch_cols_R].max(axis=1),
+        ], axis=1).max(axis=1)
+        panels.append((notch_max, 15, "Encoche max (3/4/6 kHz) [dB]", "NIHL > 15 dB"))
+
+    if "low_freq_pta_L" in feature_df.columns and "low_freq_pta_R" in feature_df.columns:
+        lf_max = feature_df[["low_freq_pta_L", "low_freq_pta_R"]].max(axis=1)
+        panels.append((lf_max, 25, "PTA basses fréquences max [dB]", "Ménière > 25 dB"))
+
+    if delta_df is not None and "sts_L" in delta_df.columns and "sts_R" in delta_df.columns:
+        sts_max = delta_df[["sts_L", "sts_R"]].max(axis=1).dropna()
+        panels.append((sts_max, 10, "STS OSHA max [dB]", "STS ≥ 10 dB"))
+
+    if not panels:
+        print("Aucune métrique disponible pour plot_rule_distributions.")
+        return
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6 * len(panels), 4))
+    if len(panels) == 1:
+        axes = [axes]
+
+    for ax, (values, threshold, xlabel, label) in zip(axes, panels):
+        v = values.dropna()
+        ax.hist(v, bins=40, color="steelblue", edgecolor="white", alpha=0.8)
+        ax.axvline(threshold, color="red", linestyle="--", linewidth=1.5, label=f"Seuil : {label}")
+        pct = 100 * (v >= threshold).mean()
+        ax.set_title(f"{pct:.1f} % flaggés")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Nombre d'audiogrammes")
+        ax.legend(fontsize=8)
+
+    plt.suptitle("Distribution des métriques cliniques", fontsize=12)
+    plt.tight_layout()
+
+
+def plot_nihl_mean_profile(
+    feature_df: pd.DataFrame,
+    scores_df: pd.DataFrame,
+) -> None:
+    """
+    Profil audiométrique moyen des audiogrammes flaggés NIHL vs non-flaggés.
+
+    Si la règle est correcte, les flaggés doivent montrer une encoche visible
+    à 3–6 kHz sur le profil moyen (zone ombrée = ±1 écart-type).
+    """
+    from src.features import STANDARD_FREQS
+
+    freqs = STANDARD_FREQS
+    nihl = scores_df["nihl_flag"].fillna(0).astype(bool)
+    nihl.index = feature_df.index
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    for ax, ear, label in zip(axes, ["L", "R"], ["Gauche (OG)", "Droite (OD)"]):
+        cols = [f"{ear}_{f}" for f in freqs if f"{ear}_{f}" in feature_df.columns]
+        f_vals = [f for f in freqs if f"{ear}_{f}" in feature_df.columns]
+        if not cols:
+            continue
+
+        for flag_val, color, name in [(True, "tomato", "NIHL flaggé"), (False, "steelblue", "Non flaggé")]:
+            subset = feature_df.loc[nihl == flag_val, cols]
+            if subset.empty:
+                continue
+            mean = subset.mean()
+            std  = subset.std()
+            ax.plot(f_vals, mean.values, color=color, linewidth=2, label=f"{name} (n={len(subset)})")
+            ax.fill_between(f_vals, mean - std, mean + std, alpha=0.15, color=color)
+
+        ax.set_xscale("log")
+        ax.set_xticks(freqs)
+        ax.set_xticklabels([str(f) if f < 1000 else f"{f//1000}k" for f in freqs])
+        ax.invert_yaxis()
+        ax.set_ylim(80, -15)
+        ax.set_xlabel("Fréquence (Hz)")
+        ax.set_ylabel("Résidu corrigé moyen (dB)")
+        ax.set_title(f"Oreille {label}")
+        ax.axhline(0, color="gray", linestyle=":", alpha=0.5)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.25)
+
+    plt.suptitle("Profil moyen NIHL flaggé vs non-flaggé (±1 σ)", fontsize=12)
+    plt.tight_layout()
+
+
+def plot_prevalence_check(scores_df: pd.DataFrame) -> None:
+    """
+    Compare les taux de flags observés aux plages épidémiologiques attendues.
+
+    Un taux hors plage indique un seuil probablement mal calibré.
+    """
+    # (colonne, label, borne_basse_%, borne_haute_%, couleur_barre)
+    rules = [
+        ("nihl_flag",        "NIHL",         15, 30, "steelblue"),
+        ("meniere_flag",     "Ménière",        1,  5, "mediumseagreen"),
+        ("sts_flag",         "STS OSHA",       5, 15, "darkorange"),
+        ("anomaly_consensus","Consensus ML", None, None, "slategray"),
+    ]
+
+    n = len(scores_df)
+    labels, rates, lo, hi, colors = [], [], [], [], []
+    for col, label, lo_pct, hi_pct, color in rules:
+        if col not in scores_df.columns:
+            continue
+        rate = 100 * scores_df[col].fillna(0).mean()
+        labels.append(label)
+        rates.append(rate)
+        lo.append(lo_pct)
+        hi.append(hi_pct)
+        colors.append(color)
+
+    _, ax = plt.subplots(figsize=(8, 4))
+    x = range(len(labels))
+    bars = ax.bar(x, rates, color=colors, alpha=0.85, edgecolor="white", width=0.5)
+
+    for i, (l, h) in enumerate(zip(lo, hi)):
+        if l is not None:
+            ax.axhspan(l, h, xmin=(i) / len(labels), xmax=(i + 1) / len(labels),
+                       color="gold", alpha=0.25, linewidth=0)
+            ax.text(i, h + 0.5, f"attendu {l}–{h}%", ha="center", va="bottom",
+                    fontsize=7.5, color="goldenrod")
+
+    for bar, rate in zip(bars, rates):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+                f"{rate:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("% audiogrammes flaggés")
+    ax.set_title(f"Prévalence des flags (n={n}) vs plages épidémiologiques attendues")
+    ax.set_ylim(0, max(rates + [31]) * 1.15)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+
+
+def plot_young_baseline_fpr(df: pd.DataFrame, scores_df: pd.DataFrame) -> None:
+    """
+    Taux de flags anomaly_final par tranche d'âge sur les Baseline.
+
+    Les Baseline de sujets jeunes (< 30 ans) devraient être quasi-normaux.
+    Un taux élevé chez les jeunes signale des faux positifs.
+    """
+    if "anomaly_final" not in scores_df.columns:
+        print("Colonne anomaly_final absente de scores_df.")
+        return
+
+    joined = df[["age_at_visit", "visit_category"]].copy()
+    joined.index = scores_df.index
+    joined["anomaly_final"] = scores_df["anomaly_final"].values
+
+    bins   = [0, 30, 45, 60, 120]
+    labels = ["< 30", "30–45", "45–60", "> 60"]
+    joined["age_bin"] = pd.cut(joined["age_at_visit"], bins=bins, labels=labels, right=False)
+
+    visit_labels = {0: "Baseline", 1: "Periodic", 2: "Depart"}
+    joined["visit_label"] = joined["visit_category"].map(visit_labels).fillna("?")
+
+    rates = (
+        joined.groupby(["age_bin", "visit_label"], observed=True)["anomaly_final"]
+        .mean() * 100
+    ).reset_index()
+    rates.columns = ["age_bin", "visit_label", "flag_rate"]
+
+    pivot = rates.pivot(index="age_bin", columns="visit_label", values="flag_rate").fillna(0)
+
+    _, ax = plt.subplots(figsize=(9, 4))
+    pivot.plot(kind="bar", ax=ax, edgecolor="white", alpha=0.85)
+
+    ax.axhline(5, color="red", linestyle="--", linewidth=1, alpha=0.6, label="Seuil FP indicatif 5%")
+    ax.set_xlabel("Tranche d'âge")
+    ax.set_ylabel("% anomaly_final flaggés")
+    ax.set_title("Taux de flags par âge et type de visite")
+    ax.legend(title="Type de visite", fontsize=8)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
+    ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
 
 

@@ -13,7 +13,7 @@ from scipy.interpolate import interp1d
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
-STANDARD_FREQS = [250, 500, 1000, 2000, 4000, 8000]
+STANDARD_FREQS = [250, 500, 1000, 2000, 3000, 4000, 6000, 8000]
 
 PTA_FREQS = [500, 1000, 2000, 4000]
 
@@ -156,26 +156,47 @@ def compute_high_freq_drop(thresholds: dict) -> float:
     return float(v8 - v4)
 
 
-def compute_notch_4k(thresholds: dict) -> float:
+def compute_notch_derivative(
+    thresholds: dict, freq_lo: int = 2000, freq_hi: int = 8000
+) -> tuple[float, float]:
     """
-    Profondeur de l'encoche à 4 kHz (signature NIHL).
+    Détecte l'encoche la plus profonde entre freq_lo et freq_hi par dérivée discrète.
 
-    Formule : T(4kHz) − moyenne(T(2kHz), T(8kHz))
+    Principe :
+    - Dérivée 1ère normalisée par octave : dT / d(log2 f)
+    - Un changement de signe + → − signale un maximum local (creux audiométrique NIHL)
+    - Profondeur = valeur_pic − moyenne(voisin_gauche, voisin_droit)
 
-    Valeur positive = 4kHz spécifiquement élevé par rapport à ses voisins → patron NIHL.
-    Valeur proche de 0 = perte uniforme (presbyacousie) ou audition normale.
-    Seuil clinique indicatif : > 15 dB.
+    Avantage vs formule fixe à 4kHz : capte les encoches à 3, 4 ou 6 kHz sans hypothèse
+    sur la fréquence, et reste robuste si la récupération à 8kHz est absente.
 
-    Contrairement à high_freq_drop (8kHz − 4kHz), ce feature capture les deux
-    côtés de la chute et n'est pas biaisé par une perte générale haute fréquence.
+    Retourne (notch_depth, notch_freq) :
+    - notch_depth : profondeur en dB (0.0 si aucun creux détecté)
+    - notch_freq  : fréquence Hz du creux, np.nan si aucun
     """
-    v2 = thresholds.get(2000, np.nan)
-    v4 = thresholds.get(4000, np.nan)
-    v8 = thresholds.get(8000, np.nan)
-    if np.isnan(v4) or (np.isnan(v2) and np.isnan(v8)):
-        return np.nan
-    neighbors = [v for v in (v2, v8) if not np.isnan(v)]
-    return float(v4 - np.mean(neighbors))
+    freqs = sorted([
+        f for f in thresholds
+        if freq_lo <= f <= freq_hi and not np.isnan(thresholds.get(f, np.nan))
+    ])
+
+    if len(freqs) < 3:
+        return 0.0, np.nan
+
+    vals  = np.array([thresholds[f] for f in freqs], dtype=float)
+    log_f = np.log2(np.array(freqs, dtype=float))
+    d1    = np.diff(vals) / np.diff(log_f)
+
+    best_depth = 0.0
+    best_freq  = np.nan
+
+    for i in range(len(d1) - 1):
+        if d1[i] > 0 and d1[i + 1] < 0:
+            depth = vals[i + 1] - (vals[i] + vals[i + 2]) / 2
+            if depth > best_depth:
+                best_depth = depth
+                best_freq  = float(freqs[i + 1])
+
+    return best_depth, best_freq
 
 
 def compute_low_freq_pta(thresholds: dict) -> float:
@@ -257,8 +278,8 @@ def extract_features(row: pd.Series) -> dict:
     features["PTA_R"] = compute_pta(right_thresh)
     features["high_freq_drop_L"] = compute_high_freq_drop(left_thresh)
     features["high_freq_drop_R"] = compute_high_freq_drop(right_thresh)
-    features["notch_4k_L"] = compute_notch_4k(left_thresh)
-    features["notch_4k_R"] = compute_notch_4k(right_thresh)
+    features["notch_depth_L"], features["notch_freq_L"] = compute_notch_derivative(left_thresh)
+    features["notch_depth_R"], features["notch_freq_R"] = compute_notch_derivative(right_thresh)
     # Seuils absolus avant correction — critère Barany Society 2015 (Ménière)
     features["low_freq_pta_L"] = compute_low_freq_pta(left_thresh_raw)
     features["low_freq_pta_R"] = compute_low_freq_pta(right_thresh_raw)

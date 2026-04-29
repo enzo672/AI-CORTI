@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="results",
-        help="Dossier de sortie (modèles, scores CSV, figures)",
+        default=None,
+        help="Dossier de sortie (modèles, scores CSV, figures). Défaut : results/<mode>",
     )
     parser.add_argument(
         "--no-plots",
@@ -92,7 +92,7 @@ def build_features(df: pd.DataFrame, mode: str):
         X, scaler, imputer = preprocess(feature_df, fit=True)
         df_pipeline = df
         print(f"  Shape matrice : {X.shape} — {len(feature_cols)} features")
-        return X, df_pipeline, feature_df, scaler, imputer
+        return X, df_pipeline, feature_df, scaler, imputer, None
 
     # mode == "delta"
     feature_df, feature_cols = build_feature_matrix(df)
@@ -110,13 +110,15 @@ def build_features(df: pd.DataFrame, mode: str):
         )
         X, scaler, imputer = preprocess(feature_df, fit=True)
         df_pipeline = df
+        return X, df_pipeline, feature_df, scaler, imputer, None
     else:
-        X, scaler, imputer = preprocess(delta_df[delta_mask], fit=True)
+        delta_filtered = delta_df[delta_mask].reset_index(drop=True)
+        X, scaler, imputer = preprocess(delta_filtered, fit=True)
         df_pipeline = df[delta_mask].reset_index(drop=True)
         feature_df = feature_df[delta_mask].reset_index(drop=True)
 
     print(f"  Shape matrice : {X.shape}")
-    return X, df_pipeline, feature_df, scaler, imputer
+    return X, df_pipeline, feature_df, scaler, imputer, delta_filtered
 
 
 def save_outputs(
@@ -230,10 +232,10 @@ def main() -> None:
         print(f"Erreur : chemin introuvable → {data_path}", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir) if args.output_dir else Path("results") / args.mode
 
     df = load_data(data_path)
-    X, df_pipeline, feature_df, scaler, imputer = build_features(df, args.mode)
+    X, df_pipeline, feature_df, scaler, imputer, delta_df = build_features(df, args.mode)
 
     print("\nLancement du pipeline non supervisé...")
     from src.models.unsupervised import run_unsupervised_pipeline
@@ -245,26 +247,41 @@ def main() -> None:
         device=args.device,
     )
 
-    # Règle clinique NIHL : encoche > 15 dB à 4kHz (Coles et al. 2000)
+    # Règle NIHL : encoche > 15 dB à 3, 4 ou 6 kHz (Coles et al. 2000)
     nihl_flag = (
+        (feature_df["notch_3k_L"].fillna(0) > 15) |
+        (feature_df["notch_3k_R"].fillna(0) > 15) |
         (feature_df["notch_4k_L"].fillna(0) > 15) |
-        (feature_df["notch_4k_R"].fillna(0) > 15)
+        (feature_df["notch_4k_R"].fillna(0) > 15) |
+        (feature_df["notch_6k_L"].fillna(0) > 15) |
+        (feature_df["notch_6k_R"].fillna(0) > 15)
     ).astype(int)
     nihl_flag.index = scores_df.index
 
-    # Règle clinique Ménière : PTA BF corrigé > 25 dB (résidu vs norme âge/genre)
-    # Utilise les seuils corrigés ISO 7029 pour neutraliser la presbyacousie naturelle
+    # Règle Ménière : PTA BF corrigé > 25 dB (résidu vs norme âge/genre)
     low_L = feature_df[["L_250", "L_500", "L_1000"]].mean(axis=1)
     low_R = feature_df[["R_250", "R_500", "R_1000"]].mean(axis=1)
     meniere_flag = ((low_L.fillna(0) > 25) | (low_R.fillna(0) > 25)).astype(int)
     meniere_flag.index = scores_df.index
 
+    # Règle STS OSHA : shift ≥ 10 dB en moyenne 2/3/4 kHz vs Baseline (mode delta uniquement)
+    if delta_df is not None and "has_sts_L" in delta_df.columns:
+        sts_flag = (
+            (delta_df["has_sts_L"].fillna(0) == 1) |
+            (delta_df["has_sts_R"].fillna(0) == 1)
+        ).astype(int)
+        sts_flag.index = scores_df.index
+    else:
+        sts_flag = pd.Series(0, index=scores_df.index)
+
     scores_df["nihl_flag"]    = nihl_flag
     scores_df["meniere_flag"] = meniere_flag
+    scores_df["sts_flag"]     = sts_flag
     scores_df["anomaly_final"] = (
         (scores_df["anomaly_consensus"] == 1) |
         (scores_df["nihl_flag"] == 1) |
-        (scores_df["meniere_flag"] == 1)
+        (scores_df["meniere_flag"] == 1) |
+        (scores_df["sts_flag"] == 1)
     ).astype(int)
 
     print("\n=== Résultats ===")

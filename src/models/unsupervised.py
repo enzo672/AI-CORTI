@@ -166,6 +166,7 @@ def run_unsupervised_pipeline(
     contamination: float = 0.05,
     ae_epochs: int = 100,
     device: str = "cpu",
+    feature_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, IsolationForest, Autoencoder]:
     """
     Lance les trois méthodes non supervisées et combine leurs scores.
@@ -195,5 +196,12 @@ def run_unsupervised_pipeline(
         + scores_df["anomaly_flag_pca"]
         >= 2
     ).astype(int)
+
+    # Règle clinique NIHL : creux > 15 dB entre 2–8 kHz (dérivée discrète)
+    if feature_df is not None:
+        scores_df["nihl_flag"] = (
+            (feature_df["notch_depth_L"].fillna(0) > 15) |
+            (feature_df["notch_depth_R"].fillna(0) > 15)
+        ).astype(int).values
 
     return scores_df, if_model, ae_model, loss_history

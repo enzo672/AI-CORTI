@@ -286,10 +286,10 @@ def score_synthetic(synth_df: pd.DataFrame, models: dict,
 
     consensus = ((if_flags + ae_flags + pca_flags) >= 2).astype(int)
 
-    # Règle clinique NIHL : encoche > 15 dB à 4kHz (Coles et al. 2000)
+    # Règle clinique NIHL : creux > 15 dB entre 2–8 kHz (dérivée discrète)
     nihl_flag = (
-        (feature_df["notch_4k_L"].fillna(0) > 15) |
-        (feature_df["notch_4k_R"].fillna(0) > 15)
+        (feature_df["notch_depth_L"].fillna(0) > 15) |
+        (feature_df["notch_depth_R"].fillna(0) > 15)
     ).astype(int)
 
     # Règle clinique Ménière : PTA BF corrigé > 25 dB (résidu vs norme âge/genre)
