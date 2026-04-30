@@ -262,9 +262,13 @@ def main() -> None:
     if already_clean:
         df = df_raw
     else:
-        from src.cleaning import clean_dataset, cleaning_report
-        df, rejected_df = clean_dataset(df_raw)
-        cleaning_report(df_raw, df, rejected_df)
+        print(
+            "⚠  Données brutes détectées — le nettoyage complet n'est plus géré ici.\n"
+            "   Exécuter notebooks/04_data_cleaning.ipynb pour produire data/clean_dataset.json,\n"
+            "   puis relancer : python main.py --data data/clean_dataset.json",
+            file=sys.stderr,
+        )
+        df = df_raw
 
     X, df_pipeline, feature_df, scaler, imputer, delta_df = build_features(df, args.mode)
 
