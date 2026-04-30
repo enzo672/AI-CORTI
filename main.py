@@ -3,8 +3,11 @@ Point d'entrée CLI pour le pipeline de détection d'anomalies sur audiogrammes.
 
 Usage :
     python main.py --data sample.json
-    python main.py --data data/raw/ --mode delta --epochs 200 --output-dir results/
-    python main.py --data sample.json --no-plots --contamination 0.1
+    python main.py --data data/ --mode delta --epochs 200 --output-dir results/
+    python main.py --data data/ --no-plots --contamination 0.1
+
+Le dossier data/ peut contenir plusieurs fichiers ..._01.json, ..._02.json, etc.
+Ils sont fusionnés automatiquement avec déduplication et tracking par source_file.
 """
 
 import argparse
@@ -72,13 +75,15 @@ def load_data(data_path: Path) -> pd.DataFrame:
     if data_path.is_dir():
         print(f"Chargement du dossier : {data_path}")
         df = load_dataset(data_path)
+        n_files = df["source_file"].nunique()
+        print(f"  {len(df)} records valides — {df['patient'].nunique()} patients — {n_files} fichier(s)")
     else:
         print(f"Chargement du fichier : {data_path}")
         records = load_json_file(data_path)
         df = pd.DataFrame(records)
         df = df.sort_values(["patient", "visit_date"]).reset_index(drop=True)
+        print(f"  {len(df)} records valides — {df['patient'].nunique()} patients uniques")
 
-    print(f"  {len(df)} records valides — {df['patient'].nunique()} patients uniques")
     return df
 
 

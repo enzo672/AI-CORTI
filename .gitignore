@@ -10,10 +10,8 @@ build/
 .env
 .claude/
 
-# Données locales (récupérées depuis MongoDB)
-data/raw/
-data/processed/
-data/normalized/
+# Données locales (fichiers patients — ne jamais committer)
+data/*.json
 *.csv
 *.parquet
 *.bson

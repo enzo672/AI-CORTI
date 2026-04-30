@@ -140,14 +140,18 @@ def load_record(record: dict) -> dict:
 def load_json_file(path: Union[str, Path]) -> list[dict]:
     """
     Charge un fichier JSON (un record ou une liste de records) et retourne
-    une liste de records parsés.
+    une liste de records parsés, chacun annoté avec son fichier source.
     """
+    path = Path(path)
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
     records = raw if isinstance(raw, list) else [raw]
     parsed = [load_record(r) for r in records]
-    return [r for r in parsed if r is not None]
+    result = [r for r in parsed if r is not None]
+    for r in result:
+        r["source_file"] = path.name
+    return result
 
 
 def load_dataset(data_dir: Union[str, Path]) -> pd.DataFrame:
@@ -157,17 +161,30 @@ def load_dataset(data_dir: Union[str, Path]) -> pd.DataFrame:
     Chaque ligne = un rapport d'audiométrie valide.
     Les records sont triés par patient puis par visit_date pour faciliter
     l'analyse temporelle (Baseline → Periodic → Depart).
+    La colonne source_file indique le fichier d'origine de chaque record.
     """
     data_dir = Path(data_dir)
     all_records = []
-    for json_file in sorted(data_dir.glob("*.json")):
-        all_records.extend(load_json_file(json_file))
+
+    json_files = sorted(data_dir.glob("*.json"))
+    if not json_files:
+        raise ValueError(f"Aucun fichier JSON trouvé dans {data_dir}")
+
+    for json_file in json_files:
+        records = load_json_file(json_file)
+        print(f"  {json_file.name} : {len(records)} records")
+        all_records.extend(records)
 
     if not all_records:
         raise ValueError(f"Aucun record valide trouvé dans {data_dir}")
 
     df = pd.DataFrame(all_records)
+
+    # Déduplication : par record_id (MongoDB) ou par clé fonctionnelle (CORTI)
     if df["record_id"].notna().any():
         df = df.drop_duplicates(subset=["record_id"])
+    else:
+        df = df.drop_duplicates(subset=["patient", "visit_date", "visit_category"])
+
     df = df.sort_values(["patient", "visit_date"]).reset_index(drop=True)
     return df
