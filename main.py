@@ -2,12 +2,14 @@
 Point d'entrée CLI pour le pipeline de détection d'anomalies sur audiogrammes.
 
 Usage :
-    python main.py --data sample.json
+    python main.py --data data/clean_dataset.pkl   ← recommandé après 04_data_cleaning.ipynb
+    python main.py --data data/                    ← charge + nettoie à la volée
     python main.py --data data/ --mode delta --epochs 200 --output-dir results/
-    python main.py --data data/ --no-plots --contamination 0.1
 
 Le dossier data/ peut contenir plusieurs fichiers ..._01.json, ..._02.json, etc.
 Ils sont fusionnés automatiquement avec déduplication et tracking par source_file.
+Si un fichier .pkl est fourni (produit par 04_data_cleaning.ipynb), le nettoyage
+est ignoré — les données sont déjà propres.
 """
 
 import argparse
@@ -28,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data",
         required=True,
-        help="Fichier JSON ou dossier contenant les exports MongoDB",
+        help="clean_dataset.json (produit par 04_data_cleaning.ipynb), fichier .json, ou dossier data/",
     )
     parser.add_argument(
         "--mode",
@@ -69,22 +71,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_data(data_path: Path) -> pd.DataFrame:
+def load_data(data_path: Path) -> tuple[pd.DataFrame, bool]:
+    """
+    Retourne (df, already_clean).
+    already_clean=True si les données viennent d'un .pkl (déjà nettoyées).
+    """
+    if data_path.name == "clean_dataset.json":
+        print(f"Chargement dataset propre : {data_path}")
+        df = pd.read_json(data_path, orient="records")
+        # Les clés de dots sont sérialisées en string par JSON → reconvertir en float
+        for col in ("dots_left", "dots_right"):
+            df[col] = df[col].apply(
+                lambda d: {float(k): v for k, v in d.items()} if isinstance(d, dict) else {}
+            )
+        df["visit_date"] = pd.to_datetime(df["visit_date"], utc=True)
+        print(f"  {len(df)} records — {df['patient'].nunique()} patients (nettoyage ignoré)")
+        return df, True
+
     from src.loader import load_dataset, load_json_file
 
     if data_path.is_dir():
         print(f"Chargement du dossier : {data_path}")
         df = load_dataset(data_path)
         n_files = df["source_file"].nunique()
-        print(f"  {len(df)} records valides — {df['patient'].nunique()} patients — {n_files} fichier(s)")
+        print(f"  {len(df)} records — {df['patient'].nunique()} patients — {n_files} fichier(s)")
     else:
         print(f"Chargement du fichier : {data_path}")
         records = load_json_file(data_path)
         df = pd.DataFrame(records)
         df = df.sort_values(["patient", "visit_date"]).reset_index(drop=True)
-        print(f"  {len(df)} records valides — {df['patient'].nunique()} patients uniques")
+        print(f"  {len(df)} records — {df['patient'].nunique()} patients")
 
-    return df
+    return df, False
 
 
 def build_features(df: pd.DataFrame, mode: str):
@@ -239,11 +257,14 @@ def main() -> None:
 
     output_dir = Path(args.output_dir) if args.output_dir else Path("results") / args.mode
 
-    df_raw = load_data(data_path)
+    df_raw, already_clean = load_data(data_path)
 
-    from src.cleaning import clean_dataset, cleaning_report
-    df, rejected_df = clean_dataset(df_raw)
-    cleaning_report(df_raw, df, rejected_df)
+    if already_clean:
+        df = df_raw
+    else:
+        from src.cleaning import clean_dataset, cleaning_report
+        df, rejected_df = clean_dataset(df_raw)
+        cleaning_report(df_raw, df, rejected_df)
 
     X, df_pipeline, feature_df, scaler, imputer, delta_df = build_features(df, args.mode)
 
