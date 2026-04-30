@@ -17,10 +17,14 @@ import pandas as pd
 
 DB_MIN: float = -10.0
 DB_MAX: float = 120.0
-MIN_FREQS_PER_EAR: int = 4
+MIN_FREQS_PER_EAR: int = 7
 CALIBRATION_MAX_DB: float = 10.0
 CALIBRATION_MAX_STD: float = 2.0
 ABERRANT_NEIGHBOR_DIFF_DB: float = 35.0  # écart max vs interpolation des voisins
+
+# Fréquences obligatoires pour un bilan clinique valide
+MANDATORY_FREQS: set[float] = {1000.0, 2000.0, 4000.0}
+MANDATORY_HIGH_FREQS: set[float] = {6000.0, 8000.0}  # au moins une des deux
 
 
 # ─── Détection point aberrant ─────────────────────────────────────────────────
@@ -73,16 +77,25 @@ def audit_record(row: pd.Series) -> list[str]:
     if len(dots_right) < MIN_FREQS_PER_EAR:
         issues.append(f"too_few_freqs_right:{len(dots_right)}")
 
-    # 3. Valeurs hors range physiologique
+    # 3. Fréquences cliniquement obligatoires manquantes
+    for dots, side in [(dots_left, "left"), (dots_right, "right")]:
+        freqs = set(dots.keys())
+        missing_mandatory = MANDATORY_FREQS - freqs
+        if missing_mandatory:
+            issues.append(f"missing_mandatory_freqs_{side}:{sorted(missing_mandatory)}")
+        if not (freqs & MANDATORY_HIGH_FREQS):
+            issues.append(f"missing_high_freq_{side}")
+
+    # 4. Valeurs hors range physiologique
     out_of_range = [v for v in all_vals if v < DB_MIN or v > DB_MAX]
     if out_of_range:
         issues.append(f"out_of_range:{out_of_range[:3]}")
 
-    # 4. Audiogramme de calibration (parfaitement plat près de zéro)
+    # 5. Audiogramme de calibration (parfaitement plat près de zéro)
     if all_vals and max(all_vals) <= CALIBRATION_MAX_DB and np.std(all_vals) < CALIBRATION_MAX_STD:
         issues.append("calibration_sweep")
 
-    # 5. Points aberrants (artefacts de mesure)
+    # 6. Points aberrants (artefacts de mesure)
     aberrant_L = _find_aberrant_points(dots_left)
     aberrant_R = _find_aberrant_points(dots_right)
     if aberrant_L:
@@ -90,7 +103,7 @@ def audit_record(row: pd.Series) -> list[str]:
     if aberrant_R:
         issues.append(f"aberrant_point_right:{aberrant_R}")
 
-    # 6. Démographie manquante
+    # 7. Démographie manquante
     if pd.isna(row.get("visit_date")):
         issues.append("missing_visit_date")
     if not row.get("patient") or str(row.get("patient")).startswith("_"):
@@ -102,7 +115,13 @@ def audit_record(row: pd.Series) -> list[str]:
 # ─── Pipeline de nettoyage ────────────────────────────────────────────────────
 
 # Issues qui entraînent un rejet complet du record
-_HARD_REJECT = {"no_data", "calibration_sweep", "missing_visit_date", "too_few_freqs_left", "too_few_freqs_right", "out_of_range"}
+_HARD_REJECT = {
+    "no_data", "calibration_sweep", "missing_visit_date",
+    "too_few_freqs_left", "too_few_freqs_right",
+    "out_of_range",
+    "missing_mandatory_freqs_left", "missing_mandatory_freqs_right",
+    "missing_high_freq_left", "missing_high_freq_right",
+}
 
 
 def _is_hard_reject(issues: list[str]) -> bool:
@@ -156,14 +175,14 @@ def cleaning_report(df: pd.DataFrame, clean_df: pd.DataFrame, rejected_df: pd.Da
 
     if n_rejected > 0:
         print(f"\n  Raisons de rejet :")
-        all_reasons = rejected_df["rejection_reasons"].str.split(" | ").explode()
+        all_reasons = rejected_df["rejection_reasons"].str.split(" | ", regex=False).explode()
         reason_prefix = all_reasons.str.split(":").str[0]
         for reason, count in reason_prefix.value_counts().items():
             print(f"    {reason:30s}: {count}")
 
     if n_soft > 0:
         print(f"\n  Flags soft (points aberrants conservés) :")
-        soft_reasons = clean_df["aberrant_flags"][clean_df["aberrant_flags"] != ""].str.split(" | ").explode()
+        soft_reasons = clean_df["aberrant_flags"][clean_df["aberrant_flags"] != ""].str.split(" | ", regex=False).explode()
         soft_prefix = soft_reasons.str.split(":").str[0]
         for reason, count in soft_prefix.value_counts().items():
             print(f"    {reason:30s}: {count}")
