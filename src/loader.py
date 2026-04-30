@@ -73,6 +73,37 @@ def _parse_dots(dots_list: list) -> dict:
     return result
 
 
+_DB_MIN = -10.0
+_DB_MAX = 120.0
+_MIN_FREQS_PER_EAR = 4
+
+
+def _is_test_audiogram(dots_left: dict, dots_right: dict) -> bool:
+    """
+    Détecte les audiogrammes de test/calibration non cliniques.
+
+    Trois critères (un seul suffit à rejeter) :
+    1. Valeur hors range physiologique (< -10 ou > 120 dB HL)
+    2. Moins de 4 fréquences mesurées sur l'une ou l'autre oreille
+    3. Audiogramme anormalement plat près de zéro :
+       std < 2 dB ET tous les seuils ≤ 10 dB → sweep de calibration
+    """
+    all_vals = list(dots_left.values()) + list(dots_right.values())
+    if not all_vals:
+        return True
+
+    if any(v < _DB_MIN or v > _DB_MAX for v in all_vals):
+        return True
+
+    if len(dots_left) < _MIN_FREQS_PER_EAR or len(dots_right) < _MIN_FREQS_PER_EAR:
+        return True
+
+    if max(all_vals) <= 10.0 and float(np.std(all_vals)) < 2.0:
+        return True
+
+    return False
+
+
 def load_record(record: dict) -> dict:
     """
     Parse un record JSON en dict plat exploitable pour le ML.
@@ -122,6 +153,9 @@ def load_record(record: dict) -> dict:
     dots = audiogramme.get("dots", {})
     dots_left = _parse_dots(dots.get("left", []))
     dots_right = _parse_dots(dots.get("right", []))
+
+    if _is_test_audiogram(dots_left, dots_right):
+        return None
 
     return {
         "record_id": record_id,

@@ -239,7 +239,12 @@ def main() -> None:
 
     output_dir = Path(args.output_dir) if args.output_dir else Path("results") / args.mode
 
-    df = load_data(data_path)
+    df_raw = load_data(data_path)
+
+    from src.cleaning import clean_dataset, cleaning_report
+    df, rejected_df = clean_dataset(df_raw)
+    cleaning_report(df_raw, df, rejected_df)
+
     X, df_pipeline, feature_df, scaler, imputer, delta_df = build_features(df, args.mode)
 
     print("\nLancement du pipeline non supervisé...")
