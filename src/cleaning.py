@@ -20,7 +20,9 @@ DB_MAX: float = 120.0
 MIN_FREQS_PER_EAR: int = 7
 CALIBRATION_MAX_DB: float = 10.0
 CALIBRATION_MAX_STD: float = 2.0
-ABERRANT_NEIGHBOR_DIFF_DB: float = 35.0  # écart max vs interpolation des voisins
+ABERRANT_NEIGHBOR_DIFF_DB: float = 35.0
+MAX_INTERAURAL_ASYMMETRY_DB: float = 60.0   # soft flag au-delà
+MAX_COVERAGE_MISMATCH_FREQS: int = 2         # hard reject si OG/OD diffèrent de > 2 fréquences
 
 # Fréquences obligatoires pour un bilan clinique valide
 MANDATORY_FREQS: set[float] = {1000.0, 2000.0, 4000.0}
@@ -95,7 +97,22 @@ def audit_record(row: pd.Series) -> list[str]:
     if all_vals and max(all_vals) <= CALIBRATION_MAX_DB and np.std(all_vals) < CALIBRATION_MAX_STD:
         issues.append("calibration_sweep")
 
-    # 6. Points aberrants (artefacts de mesure)
+    # 6. Couverture fréquentielle asymétrique entre OG et OD
+    freqs_L = set(dots_left.keys())
+    freqs_R = set(dots_right.keys())
+    mismatch = len(freqs_L.symmetric_difference(freqs_R))
+    if mismatch > MAX_COVERAGE_MISMATCH_FREQS:
+        issues.append(f"coverage_mismatch_LR:{sorted(freqs_L.symmetric_difference(freqs_R))}")
+
+    # 7. Asymétrie inter-auriculaire extrême à une même fréquence
+    common_freqs = freqs_L & freqs_R
+    if common_freqs:
+        max_asym = max(abs(dots_left[f] - dots_right[f]) for f in common_freqs)
+        if max_asym > MAX_INTERAURAL_ASYMMETRY_DB:
+            worst_freq = max(common_freqs, key=lambda f: abs(dots_left[f] - dots_right[f]))
+            issues.append(f"extreme_asymmetry:{int(worst_freq)}Hz_{int(max_asym)}dB")
+
+    # 8. Points aberrants (artefacts de mesure)
     aberrant_L = _find_aberrant_points(dots_left)
     aberrant_R = _find_aberrant_points(dots_right)
     if aberrant_L:
@@ -103,7 +120,7 @@ def audit_record(row: pd.Series) -> list[str]:
     if aberrant_R:
         issues.append(f"aberrant_point_right:{aberrant_R}")
 
-    # 7. Démographie manquante
+    # 9. Démographie manquante
     if pd.isna(row.get("visit_date")):
         issues.append("missing_visit_date")
     if not row.get("patient") or str(row.get("patient")).startswith("_"):
@@ -121,6 +138,8 @@ _HARD_REJECT = {
     "out_of_range",
     "missing_mandatory_freqs_left", "missing_mandatory_freqs_right",
     "missing_high_freq_left", "missing_high_freq_right",
+    "coverage_mismatch_LR",
+    # extreme_asymmetry → soft flag uniquement (surdité unilatérale possible)
 }
 
 
